@@ -5,12 +5,16 @@
 #pragma once
 
 // standard includes
+#include <algorithm>
 #include <bitset>
+#include <cstdio>
 #include <filesystem>
 #include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 // lib includes
 #include <boost/core/noncopyable.hpp>
@@ -677,6 +681,101 @@ namespace platf {
   };
 
   /**
+   * @brief Rectangle of one display inside a spanned (multi-monitor) capture.
+   */
+  struct span_rect_t {
+    int x;  ///< Left edge in pixels, relative to the left edge of the spanned image.
+    int y;  ///< Top edge in pixels, relative to the top edge of the spanned image.
+    int width;  ///< Width in pixels.
+    int height;  ///< Height in pixels.
+  };
+
+  /**
+   * @brief Where one host display is drawn inside a spanned image.
+   */
+  struct span_map_entry_t {
+    span_rect_t dest;  ///< Area of the spanned image that shows the display.
+    span_rect_t source;  ///< Area of the display, relative to the top-left corner of all spanned host displays.
+  };
+
+  /**
+   * @brief Serialize a spanned display layout.
+   *
+   * @param layout Rectangles to serialize.
+   * @return Layout as `x,y,width,height` entries separated by `;`, or an empty string.
+   */
+  inline std::string span_layout_to_string(const std::vector<span_rect_t> &layout) {
+    std::string result;
+    for (const auto &rect : layout) {
+      if (!result.empty()) {
+        result += ';';
+      }
+      result += std::to_string(rect.x) + ',' + std::to_string(rect.y) + ',' + std::to_string(rect.width) + ',' + std::to_string(rect.height);
+    }
+    return result;
+  }
+
+  /**
+   * @brief Parse a layout produced by span_layout_to_string().
+   *
+   * @param text Layout text to parse.
+   * @return Parsed rectangles, or an empty list when the text is empty or malformed.
+   */
+  inline std::vector<span_rect_t> span_layout_from_string(const std::string &text) {
+    std::vector<span_rect_t> result;
+    std::size_t start = 0;
+    while (start < text.size()) {
+      auto end = text.find(';', start);
+      if (end == std::string::npos) {
+        end = text.size();
+      }
+
+      span_rect_t rect {};
+      if (std::sscanf(text.substr(start, end - start).c_str(), "%d,%d,%d,%d", &rect.x, &rect.y, &rect.width, &rect.height) != 4 || rect.width <= 0 || rect.height <= 0) {
+        return {};
+      }
+      result.push_back(rect);
+      start = end + 1;
+    }
+    return result;
+  }
+
+  /**
+   * @brief Map a point of a spanned image back to host display coordinates.
+   *
+   * Points outside every display area are moved to the closest display area first.
+   *
+   * @param map Display areas of the spanned image.
+   * @param x Horizontal position inside the spanned image.
+   * @param y Vertical position inside the spanned image.
+   * @return Position relative to the top-left corner of all spanned host displays.
+   */
+  inline std::pair<float, float> span_map_point(const std::vector<span_map_entry_t> &map, float x, float y) {
+    const span_map_entry_t *best = nullptr;
+    float best_distance = 0.0f;
+    for (const auto &entry : map) {
+      const float dx = x < entry.dest.x ? entry.dest.x - x : (x > entry.dest.x + entry.dest.width ? x - (entry.dest.x + entry.dest.width) : 0.0f);
+      const float dy = y < entry.dest.y ? entry.dest.y - y : (y > entry.dest.y + entry.dest.height ? y - (entry.dest.y + entry.dest.height) : 0.0f);
+      const float distance = dx * dx + dy * dy;
+      if (!best || distance < best_distance) {
+        best = &entry;
+        best_distance = distance;
+      }
+    }
+
+    if (!best) {
+      return {x, y};
+    }
+
+    const float local_x = std::clamp(x - best->dest.x, 0.0f, static_cast<float>(best->dest.width - 1));
+    const float local_y = std::clamp(y - best->dest.y, 0.0f, static_cast<float>(best->dest.height - 1));
+    return {
+      best->source.x + local_x * best->source.width / best->dest.width,
+      best->source.y + local_y * best->source.height / best->dest.height,
+    };
+  }
+
+  /**
    * @brief Abstract display capture backend used by the streaming pipeline.
    */
   class display_t {
@@ -793,6 +892,7 @@ namespace platf {
     int height {0};  ///< Height of the captured display in physical pixels.
     int logical_width {0};  ///< Width of the captured display after display scaling.
     int logical_height {0};  ///< Height of the captured display after display scaling.
+    std::vector<span_map_entry_t> span_map;  ///< Display areas of a spanned capture; empty for a single display.
 
   protected:
     // collect capture timing data (at loglevel debug)
@@ -930,16 +1030,6 @@ namespace platf {
   std::vector<std::string> display_names(mem_type_e hwdevice_type);
 
   /**
-   * @brief Rectangle of one display inside a spanned (multi-monitor) capture.
-   */
-  struct span_rect_t {
-    int x;  ///< Left edge in pixels, relative to the left edge of the spanned capture.
-    int y;  ///< Top edge in pixels, relative to the top edge of the spanned capture.
-    int width;  ///< Width of the display in pixels.
-    int height;  ///< Height of the display in pixels.
-  };
-
-  /**
    * @brief Get the layout of the displays that a spanned capture would combine.
    *
    * A spanned capture combines every display attached to one GPU into a single image
@@ -950,23 +1040,6 @@ namespace platf {
    *         spanned capture is unsupported or fewer than two displays are available.
    */
   std::vector<span_rect_t> span_display_layout();
-
-  /**
-   * @brief Serialize a spanned display layout for the serverinfo response.
-   *
-   * @param layout Display rectangles to serialize.
-   * @return Layout as `x,y,width,height` entries separated by `;`, or an empty string.
-   */
-  inline std::string span_layout_to_string(const std::vector<span_rect_t> &layout) {
-    std::string result;
-    for (const auto &rect : layout) {
-      if (!result.empty()) {
-        result += ';';
-      }
-      result += std::to_string(rect.x) + ',' + std::to_string(rect.y) + ',' + std::to_string(rect.width) + ',' + std::to_string(rect.height);
-    }
-    return result;
-  }
 
   /**
    * @brief Check if GPUs/drivers have changed since the last call to this function.

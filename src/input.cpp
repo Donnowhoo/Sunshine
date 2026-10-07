@@ -790,6 +790,13 @@ namespace input {
     x = (x - offsetX) * touch_port.scalar_inv;
     y = (y - offsetY) * touch_port.scalar_inv;
 
+    // A spanned capture may scale and move each display, so map the point back to the display it shows.
+    if (!touch_port.span_map.empty()) {
+      const auto mapped = platf::span_map_point(touch_port.span_map, x, y);
+      x = mapped.first;
+      y = mapped.second;
+    }
+
     /*
     This final operation is a bit weird and has been brought about with lots of trial and error. A better
     way to do this may exist.

@@ -507,8 +507,9 @@ namespace nvhttp {
     launch_session->gcmap = (int) util::from_view(get_arg(args, "gcmap", "0"));
     launch_session->enable_hdr = util::from_view(get_arg(args, "hdrMode", "0"));
     launch_session->span_displays = util::from_view(get_arg(args, "sunshineSpanDisplays", "0")) != 0;
+    launch_session->span_client_layout = get_arg(args, "sunshineSpanLayout", "");
     if (launch_session->span_displays) {
-      BOOST_LOG(info) << "Client requested a spanned capture of all displays"sv;
+      BOOST_LOG(info) << "Client requested a spanned capture of all displays with client layout ["sv << launch_session->span_client_layout << ']';
     }
 
     // Encrypted RTSP is enabled with client reported corever >= 1

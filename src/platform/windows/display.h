@@ -772,12 +772,16 @@ namespace platf::dxgi {
      */
     struct span_output_t {
       duplication_t dup;  ///< Desktop Duplication session for this display.
-      span_rect_t rect;  ///< Position and size of this display inside the spanned image.
+      span_rect_t source;  ///< Area of this display, relative to the top-left corner of all spanned displays.
+      span_rect_t rect;  ///< Area of the spanned image that shows this display.
+      texture2d_t staging;  ///< Copy of the latest frame that can be sampled when the display is scaled.
+      shader_res_t staging_srv;  ///< Shader view of the staging texture.
     };
 
     std::vector<std::unique_ptr<span_output_t>> span_outputs;  ///< Displays combined into the spanned image.
     texture2d_t canvas;  ///< Persistent image that holds the latest content of every display.
-    render_target_t canvas_rt;  ///< Render target used to clear the canvas.
+    render_target_t canvas_rt;  ///< Render target used to clear and draw into the canvas.
+    ps_t frame_ps;  ///< Pixel shader that copies a display frame into a scaled area of the canvas.
     int cursor_owner = -1;  ///< Index of the display that currently shows the mouse cursor, or -1.
 
   private:
@@ -787,6 +791,14 @@ namespace platf::dxgi {
      * @return True when the canvas is ready for use.
      */
     bool ensure_canvas();
+    /**
+     * @brief Draw a display frame into its area of the canvas, scaling it as needed.
+     *
+     * @param span_output Display whose frame is drawn.
+     * @param src Latest frame of the display.
+     * @return True when the frame was drawn.
+     */
+    bool draw_scaled(span_output_t &span_output, texture2d_t &src);
   };
 
   /**

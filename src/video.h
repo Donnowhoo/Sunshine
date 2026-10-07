@@ -40,6 +40,7 @@ namespace video {
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
     int spanDisplays = 0;  ///< Spanned capture: 0 = capture one display, 1 = combine all displays of one GPU into one image.
+    std::string spanClientLayout;  ///< Client monitor layout for a spanned capture, as produced by platf::span_layout_to_string().
   };
 
   namespace amf {

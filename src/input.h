@@ -209,6 +209,8 @@ namespace input {
     int env_logical_width;  ///< Width of the full capture environment after display scaling.
     int env_logical_height;  ///< Height of the full capture environment after display scaling.
 
+    std::vector<platf::span_map_entry_t> span_map;  ///< Display areas of a spanned capture; empty for a single display.
+
     /**
      * @brief Check whether the touch-port bounds are initialized.
      */

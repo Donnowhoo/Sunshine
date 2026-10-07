@@ -1846,9 +1846,16 @@ namespace platf::dxgi {
   }
 
   int display_span_vram_t::init(const ::video::config_t &config) {
-    const auto candidates = find_span_outputs();
-    if (candidates.empty()) {
-      BOOST_LOG(info) << "Spanned capture needs at least two unrotated displays on one GPU"sv;
+    auto candidates = find_span_outputs();
+
+    // Host displays are paired with the client monitors from left to right.
+    const auto client_layout = span_layout_from_string(config.spanClientLayout);
+    if (!client_layout.empty() && client_layout.size() < candidates.size()) {
+      candidates.resize(client_layout.size());
+    }
+
+    if (candidates.size() < 2) {
+      BOOST_LOG(info) << "Spanned capture needs at least two unrotated displays on one GPU and two client monitors"sv;
       return -1;
     }
 
@@ -1859,6 +1866,27 @@ namespace platf::dxgi {
 
     const auto bounds = span_bounds(candidates);
 
+    // Without a client layout, every display keeps its own size and position.
+    int client_left = 0;
+    int client_top = 0;
+    int canvas_right = bounds.right - bounds.left;
+    int canvas_bottom = bounds.bottom - bounds.top;
+    if (!client_layout.empty()) {
+      client_left = client_layout.front().x;
+      client_top = client_layout.front().y;
+      canvas_right = client_layout.front().x + client_layout.front().width;
+      canvas_bottom = client_layout.front().y + client_layout.front().height;
+      for (std::size_t i = 0; i < candidates.size(); ++i) {
+        const auto &rect = client_layout[i];
+        client_left = (std::min)(client_left, rect.x);
+        client_top = (std::min)(client_top, rect.y);
+        canvas_right = (std::max)(canvas_right, rect.x + rect.width);
+        canvas_bottom = (std::max)(canvas_bottom, rect.y + rect.height);
+      }
+      canvas_right -= client_left;
+      canvas_bottom -= client_top;
+    }
+
     // duplication_t::init() duplicates display_base_t::output, so each display is
     // temporarily installed there. The leftmost display is restored afterwards so
     // that HDR queries keep working.
@@ -1867,7 +1895,9 @@ namespace platf::dxgi {
       output.reset(primary_output.release());
     });
 
-    for (const auto &candidate : candidates) {
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+      const auto &candidate = candidates[i];
+
       output_t found;
       output_t::pointer output_p {};
       for (int y = 0; adapter->EnumOutputs(y, &output_p) != DXGI_ERROR_NOT_FOUND; ++y) {
@@ -1895,17 +1925,36 @@ namespace platf::dxgi {
         return -1;
       }
 
-      span_output->rect = {
+      span_output->source = {
         static_cast<int>(candidate.desktop.left - bounds.left),
         static_cast<int>(candidate.desktop.top - bounds.top),
         static_cast<int>(candidate.desktop.right - candidate.desktop.left),
         static_cast<int>(candidate.desktop.bottom - candidate.desktop.top),
       };
+
+      if (client_layout.empty()) {
+        span_output->rect = span_output->source;
+      } else {
+        // Fit the display into its client monitor without distorting it.
+        const auto &target = client_layout[i];
+        const auto &source = span_output->source;
+        const double scale = (std::min)(static_cast<double>(target.width) / source.width, static_cast<double>(target.height) / source.height);
+        const int fit_width = (std::max)(1, static_cast<int>(std::lround(source.width * scale)));
+        const int fit_height = (std::max)(1, static_cast<int>(std::lround(source.height * scale)));
+        span_output->rect = {
+          target.x - client_left + (target.width - fit_width) / 2,
+          target.y - client_top + (target.height - fit_height) / 2,
+          fit_width,
+          fit_height,
+        };
+      }
+
+      span_map.push_back({span_output->rect, span_output->source});
       span_outputs.push_back(std::move(span_output));
     }
 
-    width = bounds.right - bounds.left;
-    height = bounds.bottom - bounds.top;
+    width = canvas_right;
+    height = canvas_bottom;
     width_before_rotation = width;
     height_before_rotation = height;
     display_rotation = DXGI_MODE_ROTATION_IDENTITY;
@@ -1914,13 +1963,24 @@ namespace platf::dxgi {
     offset_x = bounds.left - GetSystemMetrics(SM_XVIRTUALSCREEN);
     offset_y = bounds.top - GetSystemMetrics(SM_YVIRTUALSCREEN);
 
-    BOOST_LOG(info) << "Spanned capture of "sv << span_outputs.size() << " displays ["sv << width << 'x' << height << "] at offset ["sv << offset_x << 'x' << offset_y << ']';
+    BOOST_LOG(info) << "Spanned capture of "sv << span_outputs.size() << " displays into ["sv << width << 'x' << height << "] at offset ["sv << offset_x << 'x' << offset_y << ']';
     for (const auto &span_output : span_outputs) {
+      const auto &source = span_output->source;
       const auto &rect = span_output->rect;
-      BOOST_LOG(info) << "  Display ["sv << rect.width << 'x' << rect.height << "] at ["sv << rect.x << 'x' << rect.y << ']';
+      BOOST_LOG(info) << "  Display ["sv << source.width << 'x' << source.height << "] at ["sv << source.x << 'x' << source.y << "] -> ["sv << rect.width << 'x' << rect.height << "] at ["sv << rect.x << 'x' << rect.y << ']';
     }
 
-    return init_cursor_resources(config);
+    if (init_cursor_resources(config)) {
+      return -1;
+    }
+
+    auto status = device->CreatePixelShader(cursor_ps_hlsl->GetBufferPointer(), cursor_ps_hlsl->GetBufferSize(), nullptr, &frame_ps);
+    if (FAILED(status)) {
+      BOOST_LOG(error) << "Failed to create spanned capture pixel shader [0x"sv << util::hex(status).to_string_view() << ']';
+      return -1;
+    }
+
+    return 0;
   }
 
   bool display_span_vram_t::ensure_canvas() {
@@ -1954,6 +2014,62 @@ namespace platf::dxgi {
     // Areas that no display covers (for example below a smaller display) stay black.
     const float rgb_black[] = {0.0f, 0.0f, 0.0f, 0.0f};
     device_ctx->ClearRenderTargetView(canvas_rt.get(), rgb_black);
+    return true;
+  }
+
+  bool display_span_vram_t::draw_scaled(span_output_t &span_output, texture2d_t &src) {
+    if (!span_output.staging) {
+      D3D11_TEXTURE2D_DESC desc;
+      src->GetDesc(&desc);
+
+      D3D11_TEXTURE2D_DESC t {};
+      t.Width = desc.Width;
+      t.Height = desc.Height;
+      t.MipLevels = 1;
+      t.ArraySize = 1;
+      t.SampleDesc.Count = 1;
+      t.Usage = D3D11_USAGE_DEFAULT;
+      t.Format = desc.Format;
+      t.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+      auto status = device->CreateTexture2D(&t, nullptr, &span_output.staging);
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "Failed to create spanned display staging texture [0x"sv << util::hex(status).to_string_view() << ']';
+        return false;
+      }
+
+      status = device->CreateShaderResourceView(span_output.staging.get(), nullptr, &span_output.staging_srv);
+      if (FAILED(status)) {
+        BOOST_LOG(error) << "Failed to create spanned display shader view [0x"sv << util::hex(status).to_string_view() << ']';
+        span_output.staging.reset();
+        return false;
+      }
+    }
+
+    device_ctx->CopyResource(span_output.staging.get(), src.get());
+
+    const D3D11_VIEWPORT view {
+      static_cast<float>(span_output.rect.x),
+      static_cast<float>(span_output.rect.y),
+      static_cast<float>(span_output.rect.width),
+      static_cast<float>(span_output.rect.height),
+      0.0f,
+      1.0f,
+    };
+
+    device_ctx->VSSetShader(cursor_vs.get(), nullptr, 0);
+    device_ctx->PSSetShader(frame_ps.get(), nullptr, 0);
+    device_ctx->OMSetRenderTargets(1, &canvas_rt, nullptr);
+    device_ctx->OMSetBlendState(blend_disable.get(), nullptr, 0xFFFFFFFFu);
+    device_ctx->PSSetShaderResources(0, 1, &span_output.staging_srv);
+    device_ctx->RSSetViewports(1, &view);
+    device_ctx->Draw(3, 0);
+
+    ID3D11RenderTargetView *empty_render_target = nullptr;
+    device_ctx->OMSetRenderTargets(1, &empty_render_target, nullptr);
+    device_ctx->RSSetViewports(0, nullptr);
+    ID3D11ShaderResourceView *empty_shader_resource_view = nullptr;
+    device_ctx->PSSetShaderResources(0, 1, &empty_shader_resource_view);
     return true;
   }
 
@@ -2011,8 +2127,10 @@ namespace platf::dxgi {
           }
 
           if (cursor_owner == index || cursor_owner == -1) {
-            const LONG x = span_output.rect.x + frame_info.PointerPosition.Position.x;
-            const LONG y = span_output.rect.y + frame_info.PointerPosition.Position.y;
+            const auto &source = span_output.source;
+            const auto &rect = span_output.rect;
+            const LONG x = rect.x + frame_info.PointerPosition.Position.x * rect.width / source.width;
+            const LONG y = rect.y + frame_info.PointerPosition.Position.y * rect.height / source.height;
             const bool visible = cursor_owner == index;
             cursor_alpha.set_pos(x, y, width, height, DXGI_MODE_ROTATION_IDENTITY, visible);
             cursor_xor.set_pos(x, y, width, height, DXGI_MODE_ROTATION_IDENTITY, visible);
@@ -2032,8 +2150,8 @@ namespace platf::dxgi {
           src->GetDesc(&desc);
 
           // The display layout changed since initialization, so start over.
-          if (desc.Width != span_output.rect.width || desc.Height != span_output.rect.height) {
-            BOOST_LOG(info) << "Spanned display size changed ["sv << span_output.rect.width << 'x' << span_output.rect.height << " -> "sv << desc.Width << 'x' << desc.Height << ']';
+          if (desc.Width != span_output.source.width || desc.Height != span_output.source.height) {
+            BOOST_LOG(info) << "Spanned display size changed ["sv << span_output.source.width << 'x' << span_output.source.height << " -> "sv << desc.Width << 'x' << desc.Height << ']';
             return capture_e::reinit;
           }
 
@@ -2053,7 +2171,11 @@ namespace platf::dxgi {
             return capture_e::error;
           }
 
-          device_ctx->CopySubresourceRegion(canvas.get(), 0, span_output.rect.x, span_output.rect.y, 0, src.get(), 0, nullptr);
+          if (span_output.rect.width == span_output.source.width && span_output.rect.height == span_output.source.height) {
+            device_ctx->CopySubresourceRegion(canvas.get(), 0, span_output.rect.x, span_output.rect.y, 0, src.get(), 0, nullptr);
+          } else if (!draw_scaled(span_output, src)) {
+            return capture_e::error;
+          }
           frame_updated = true;
         }
 

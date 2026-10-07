@@ -2563,7 +2563,8 @@ namespace video {
       1.0f / scalar,
       scalar_tpcoords,
       display_env_logical_width,
-      display_env_logical_height
+      display_env_logical_height,
+      display->span_map,
     };
   }
 
