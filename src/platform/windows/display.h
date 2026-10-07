@@ -776,6 +776,7 @@ namespace platf::dxgi {
       span_rect_t rect;  ///< Area of the spanned image that shows this display.
       texture2d_t staging;  ///< Copy of the latest frame that can be sampled when the display is scaled.
       shader_res_t staging_srv;  ///< Shader view of the staging texture.
+      DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;  ///< Format of the last frame received from this display.
     };
 
     std::vector<std::unique_ptr<span_output_t>> span_outputs;  ///< Displays combined into the spanned image.

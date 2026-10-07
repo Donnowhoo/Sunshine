@@ -1953,6 +1953,10 @@ namespace platf::dxgi {
       span_outputs.push_back(std::move(span_output));
     }
 
+    // Put the leftmost display back now, because the cursor setup below queries its HDR state.
+    restore_primary_output.disable();
+    output.reset(primary_output.release());
+
     width = canvas_right;
     height = canvas_bottom;
     width_before_rotation = width;
@@ -2154,6 +2158,13 @@ namespace platf::dxgi {
             BOOST_LOG(info) << "Spanned display size changed ["sv << span_output.source.width << 'x' << span_output.source.height << " -> "sv << desc.Width << 'x' << desc.Height << ']';
             return capture_e::reinit;
           }
+
+          // A display changed its format (for example HDR was toggled), so start over.
+          if (span_output.format != DXGI_FORMAT_UNKNOWN && span_output.format != desc.Format) {
+            BOOST_LOG(info) << "Capture format changed ["sv << dxgi_format_to_string(span_output.format) << " -> "sv << dxgi_format_to_string(desc.Format) << ']';
+            return capture_e::reinit;
+          }
+          span_output.format = desc.Format;
 
           if (capture_format == DXGI_FORMAT_UNKNOWN) {
             capture_format = desc.Format;
