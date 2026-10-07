@@ -280,6 +280,11 @@ namespace platf {
     return display;
   }
 
+  std::vector<span_rect_t> span_display_layout() {
+    // Spanned multi-monitor capture is only implemented for Windows.
+    return {};
+  }
+
   std::vector<std::string> display_names(mem_type_e hwdevice_type) {
     std::vector<std::string> display_names;
     if (hwdevice_type != platf::mem_type_e::system && hwdevice_type != platf::mem_type_e::videotoolbox) {

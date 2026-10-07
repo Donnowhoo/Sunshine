@@ -930,6 +930,45 @@ namespace platf {
   std::vector<std::string> display_names(mem_type_e hwdevice_type);
 
   /**
+   * @brief Rectangle of one display inside a spanned (multi-monitor) capture.
+   */
+  struct span_rect_t {
+    int x;  ///< Left edge in pixels, relative to the left edge of the spanned capture.
+    int y;  ///< Top edge in pixels, relative to the top edge of the spanned capture.
+    int width;  ///< Width of the display in pixels.
+    int height;  ///< Height of the display in pixels.
+  };
+
+  /**
+   * @brief Get the layout of the displays that a spanned capture would combine.
+   *
+   * A spanned capture combines every display attached to one GPU into a single image
+   * that covers the bounding box of those displays. Clients use this layout to place
+   * each part of the image on their own monitors.
+   *
+   * @return Display rectangles ordered from left to right, or an empty list when
+   *         spanned capture is unsupported or fewer than two displays are available.
+   */
+  std::vector<span_rect_t> span_display_layout();
+
+  /**
+   * @brief Serialize a spanned display layout for the serverinfo response.
+   *
+   * @param layout Display rectangles to serialize.
+   * @return Layout as `x,y,width,height` entries separated by `;`, or an empty string.
+   */
+  inline std::string span_layout_to_string(const std::vector<span_rect_t> &layout) {
+    std::string result;
+    for (const auto &rect : layout) {
+      if (!result.empty()) {
+        result += ';';
+      }
+      result += std::to_string(rect.x) + ',' + std::to_string(rect.y) + ',' + std::to_string(rect.width) + ',' + std::to_string(rect.height);
+    }
+    return result;
+  }
+
+  /**
    * @brief Check if GPUs/drivers have changed since the last call to this function.
    * @return `true` if a change has occurred or if it is unknown whether a change occurred.
    */

@@ -187,6 +187,31 @@ namespace platf::dxgi {
   class hwdevice_t;
 
   /**
+   * @brief Display that can take part in a spanned capture.
+   */
+  struct span_candidate_output_t {
+    std::wstring device_name;  ///< DXGI device name of the display.
+    RECT desktop;  ///< Desktop coordinates of the display.
+  };
+
+  /**
+   * @brief Find the displays of the GPU that should be combined into a spanned capture.
+   *
+   * The GPU with the most attached displays is used. Rotated displays are not supported.
+   *
+   * @return Displays sorted from left to right, or an empty list when spanned capture is unsupported.
+   */
+  std::vector<span_candidate_output_t> find_span_outputs();
+
+  /**
+   * @brief Compute the bounding box of the given displays in desktop coordinates.
+   *
+   * @param outputs Displays to measure; must not be empty.
+   * @return Rectangle that covers every display.
+   */
+  RECT span_bounds(const std::vector<span_candidate_output_t> &outputs);
+
+  /**
    * @brief Cursor position and visibility for the current capture frame.
    */
   struct cursor_t {
@@ -702,6 +727,66 @@ namespace platf::dxgi {
     texture2d_t old_surface_delayed_destruction;  ///< Old surface delayed destruction.
     std::chrono::steady_clock::time_point old_surface_timestamp;  ///< Old surface timestamp.
     std::variant<std::monostate, texture2d_t, std::shared_ptr<platf::img_t>> last_frame_variant;  ///< Last frame variant.
+
+  protected:
+    /**
+     * @brief Create the shaders, samplers and blend states used to draw the mouse cursor.
+     *
+     * @param config Configuration values to apply.
+     * @return 0 on success; nonzero on failure.
+     */
+    int init_cursor_resources(const ::video::config_t &config);
+  };
+
+  /**
+   * Display backend that combines every display of one GPU into a single image using DDAPI.
+   */
+  class display_span_vram_t: public display_ddup_vram_t {
+  public:
+    /**
+     * @brief Initialize Desktop Duplication for every display that takes part in the span.
+     *
+     * @param config Configuration values to apply.
+     * @return 0 on success; nonzero when spanned capture is unavailable.
+     */
+    int init(const ::video::config_t &config);
+    /**
+     * @brief Capture changed displays and compose them into one image.
+     *
+     * @param pull_free_image_cb Callback that provides an available image buffer.
+     * @param img_out Captured image buffer returned to the streaming pipeline.
+     * @param timeout Maximum time to wait for the operation.
+     * @param cursor_visible Cursor visible.
+     * @return Capture status reported to the streaming pipeline.
+     */
+    capture_e snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) override;
+    /**
+     * @brief Release resources associated with the last captured snapshot.
+     *
+     * @return Capture status after releasing the current snapshot.
+     */
+    capture_e release_snapshot() override;
+
+    /**
+     * @brief One display that takes part in the spanned capture.
+     */
+    struct span_output_t {
+      duplication_t dup;  ///< Desktop Duplication session for this display.
+      span_rect_t rect;  ///< Position and size of this display inside the spanned image.
+    };
+
+    std::vector<std::unique_ptr<span_output_t>> span_outputs;  ///< Displays combined into the spanned image.
+    texture2d_t canvas;  ///< Persistent image that holds the latest content of every display.
+    render_target_t canvas_rt;  ///< Render target used to clear the canvas.
+    int cursor_owner = -1;  ///< Index of the display that currently shows the mouse cursor, or -1.
+
+  private:
+    /**
+     * @brief Create the canvas texture once the capture format is known.
+     *
+     * @return True when the canvas is ready for use.
+     */
+    bool ensure_canvas();
   };
 
   /**

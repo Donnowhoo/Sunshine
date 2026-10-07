@@ -3,6 +3,7 @@
  * @brief Definitions for handling video ram.
  */
 // standard includes
+#include <algorithm>
 #include <cmath>
 
 // platform includes
@@ -1766,6 +1767,10 @@ namespace platf::dxgi {
       return -1;
     }
 
+    return init_cursor_resources(config);
+  }
+
+  int display_ddup_vram_t::init_cursor_resources(const ::video::config_t &config) {
     D3D11_SAMPLER_DESC sampler_desc {};
     sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -1838,6 +1843,312 @@ namespace platf::dxgi {
     device_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     return 0;
+  }
+
+  int display_span_vram_t::init(const ::video::config_t &config) {
+    const auto candidates = find_span_outputs();
+    if (candidates.empty()) {
+      BOOST_LOG(info) << "Spanned capture needs at least two unrotated displays on one GPU"sv;
+      return -1;
+    }
+
+    // Create the shared D3D device on the GPU of the leftmost display.
+    if (display_base_t::init(config, utf_utils::to_utf8(candidates.front().device_name))) {
+      return -1;
+    }
+
+    const auto bounds = span_bounds(candidates);
+
+    // duplication_t::init() duplicates display_base_t::output, so each display is
+    // temporarily installed there. The leftmost display is restored afterwards so
+    // that HDR queries keep working.
+    output_t primary_output {output.release()};
+    auto restore_primary_output = util::fail_guard([&]() {
+      output.reset(primary_output.release());
+    });
+
+    for (const auto &candidate : candidates) {
+      output_t found;
+      output_t::pointer output_p {};
+      for (int y = 0; adapter->EnumOutputs(y, &output_p) != DXGI_ERROR_NOT_FOUND; ++y) {
+        output_t output_tmp {output_p};
+
+        DXGI_OUTPUT_DESC desc;
+        output_tmp->GetDesc(&desc);
+        if (candidate.device_name == desc.DeviceName) {
+          found.reset(output_tmp.release());
+          break;
+        }
+      }
+
+      if (!found) {
+        BOOST_LOG(warning) << "Display ["sv << utf_utils::to_utf8(candidate.device_name) << "] is not attached to the capture GPU"sv;
+        return -1;
+      }
+
+      auto span_output = std::make_unique<span_output_t>();
+      output.reset(found.release());
+      const auto status = span_output->dup.init(this, config);
+      output.reset();
+      if (status) {
+        BOOST_LOG(warning) << "Failed to duplicate display ["sv << utf_utils::to_utf8(candidate.device_name) << ']';
+        return -1;
+      }
+
+      span_output->rect = {
+        static_cast<int>(candidate.desktop.left - bounds.left),
+        static_cast<int>(candidate.desktop.top - bounds.top),
+        static_cast<int>(candidate.desktop.right - candidate.desktop.left),
+        static_cast<int>(candidate.desktop.bottom - candidate.desktop.top),
+      };
+      span_outputs.push_back(std::move(span_output));
+    }
+
+    width = bounds.right - bounds.left;
+    height = bounds.bottom - bounds.top;
+    width_before_rotation = width;
+    height_before_rotation = height;
+    display_rotation = DXGI_MODE_ROTATION_IDENTITY;
+
+    // Absolute mouse coordinates start at the top-left corner of the virtual desktop.
+    offset_x = bounds.left - GetSystemMetrics(SM_XVIRTUALSCREEN);
+    offset_y = bounds.top - GetSystemMetrics(SM_YVIRTUALSCREEN);
+
+    BOOST_LOG(info) << "Spanned capture of "sv << span_outputs.size() << " displays ["sv << width << 'x' << height << "] at offset ["sv << offset_x << 'x' << offset_y << ']';
+    for (const auto &span_output : span_outputs) {
+      const auto &rect = span_output->rect;
+      BOOST_LOG(info) << "  Display ["sv << rect.width << 'x' << rect.height << "] at ["sv << rect.x << 'x' << rect.y << ']';
+    }
+
+    return init_cursor_resources(config);
+  }
+
+  bool display_span_vram_t::ensure_canvas() {
+    if (canvas) {
+      return true;
+    }
+
+    D3D11_TEXTURE2D_DESC t {};
+    t.Width = width;
+    t.Height = height;
+    t.MipLevels = 1;
+    t.ArraySize = 1;
+    t.SampleDesc.Count = 1;
+    t.Usage = D3D11_USAGE_DEFAULT;
+    t.Format = capture_format;
+    t.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+    auto status = device->CreateTexture2D(&t, nullptr, &canvas);
+    if (FAILED(status)) {
+      BOOST_LOG(error) << "Failed to create spanned capture canvas [0x"sv << util::hex(status).to_string_view() << ']';
+      return false;
+    }
+
+    status = device->CreateRenderTargetView(canvas.get(), nullptr, &canvas_rt);
+    if (FAILED(status)) {
+      BOOST_LOG(error) << "Failed to create spanned capture render target [0x"sv << util::hex(status).to_string_view() << ']';
+      canvas.reset();
+      return false;
+    }
+
+    // Areas that no display covers (for example below a smaller display) stay black.
+    const float rgb_black[] = {0.0f, 0.0f, 0.0f, 0.0f};
+    device_ctx->ClearRenderTargetView(canvas_rt.get(), rgb_black);
+    return true;
+  }
+
+  capture_e display_span_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+    bool frame_updated = false;
+    bool mouse_updated = false;
+    int64_t latest_qpc = 0;
+
+    while (true) {
+      for (int index = 0; index < static_cast<int>(span_outputs.size()); ++index) {
+        auto &span_output = *span_outputs[index];
+
+        DXGI_OUTDUPL_FRAME_INFO frame_info;
+        resource_t::pointer res_p {};
+        auto capture_status = span_output.dup.next_frame(frame_info, 0ms, &res_p);
+        resource_t res {res_p};
+
+        if (capture_status == capture_e::timeout) {
+          continue;
+        }
+        if (capture_status != capture_e::ok) {
+          return capture_status;
+        }
+
+        latest_qpc = (std::max)({latest_qpc, frame_info.LastPresentTime.QuadPart, frame_info.LastMouseUpdateTime.QuadPart});
+
+        if (frame_info.PointerShapeBufferSize > 0) {
+          DXGI_OUTDUPL_POINTER_SHAPE_INFO shape_info {};
+          util::buffer_t<std::uint8_t> img_data {frame_info.PointerShapeBufferSize};
+
+          UINT dummy;
+          auto status = span_output.dup.dup->GetFramePointerShape(img_data.size(), std::begin(img_data), &dummy, &shape_info);
+          if (FAILED(status)) {
+            BOOST_LOG(error) << "Failed to get new pointer shape [0x"sv << util::hex(status).to_string_view() << ']';
+            return capture_e::error;
+          }
+
+          auto alpha_cursor_img = make_cursor_alpha_image(img_data, shape_info);
+          auto xor_cursor_img = make_cursor_xor_image(img_data, shape_info);
+          if (!set_cursor_texture(device.get(), cursor_alpha, std::move(alpha_cursor_img), shape_info) || !set_cursor_texture(device.get(), cursor_xor, std::move(xor_cursor_img), shape_info)) {
+            return capture_e::error;
+          }
+          mouse_updated = true;
+        }
+
+        if (frame_info.LastMouseUpdateTime.QuadPart) {
+          // Each display reports the pointer relative to itself. Only the display that
+          // currently shows the pointer reports it as visible.
+          if (frame_info.PointerPosition.Visible) {
+            cursor_owner = index;
+          } else if (cursor_owner == index) {
+            cursor_owner = -1;
+          }
+
+          if (cursor_owner == index || cursor_owner == -1) {
+            const LONG x = span_output.rect.x + frame_info.PointerPosition.Position.x;
+            const LONG y = span_output.rect.y + frame_info.PointerPosition.Position.y;
+            const bool visible = cursor_owner == index;
+            cursor_alpha.set_pos(x, y, width, height, DXGI_MODE_ROTATION_IDENTITY, visible);
+            cursor_xor.set_pos(x, y, width, height, DXGI_MODE_ROTATION_IDENTITY, visible);
+          }
+          mouse_updated = true;
+        }
+
+        if (frame_info.LastPresentTime.QuadPart != 0) {
+          texture2d_t src;
+          auto status = res->QueryInterface(IID_ID3D11Texture2D, (void **) &src);
+          if (FAILED(status)) {
+            BOOST_LOG(error) << "Couldn't query interface [0x"sv << util::hex(status).to_string_view() << ']';
+            return capture_e::error;
+          }
+
+          D3D11_TEXTURE2D_DESC desc;
+          src->GetDesc(&desc);
+
+          // The display layout changed since initialization, so start over.
+          if (desc.Width != span_output.rect.width || desc.Height != span_output.rect.height) {
+            BOOST_LOG(info) << "Spanned display size changed ["sv << span_output.rect.width << 'x' << span_output.rect.height << " -> "sv << desc.Width << 'x' << desc.Height << ']';
+            return capture_e::reinit;
+          }
+
+          if (capture_format == DXGI_FORMAT_UNKNOWN) {
+            capture_format = desc.Format;
+            BOOST_LOG(info) << "Capture format ["sv << dxgi_format_to_string(capture_format) << ']';
+          }
+
+          if (capture_format != desc.Format) {
+            // Displays of a span must share one format. This happens when only some
+            // of them have HDR enabled.
+            BOOST_LOG(error) << "Spanned displays use different capture formats ["sv << dxgi_format_to_string(capture_format) << " and "sv << dxgi_format_to_string(desc.Format) << "]. Enable or disable HDR on all displays."sv;
+            return capture_e::error;
+          }
+
+          if (!ensure_canvas()) {
+            return capture_e::error;
+          }
+
+          device_ctx->CopySubresourceRegion(canvas.get(), 0, span_output.rect.x, span_output.rect.y, 0, src.get(), 0, nullptr);
+          frame_updated = true;
+        }
+
+        // The frame has been copied into the canvas, so it can be returned right away.
+        capture_status = span_output.dup.release_frame();
+        if (capture_status != capture_e::ok) {
+          return capture_status;
+        }
+      }
+
+      if (frame_updated || mouse_updated) {
+        break;
+      }
+
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return capture_e::timeout;
+      }
+
+      // Poll again shortly. Waiting inside AcquireNextFrame() is not possible with
+      // several displays, and sleeping here keeps the D3D device lock free for the encoder.
+      timer->sleep_for(1ms);
+    }
+
+    // Nothing to show until the first desktop image has arrived.
+    if (!canvas) {
+      return capture_e::timeout;
+    }
+
+    // A pointer update only matters when the pointer is drawn into the image.
+    if (!frame_updated && !cursor_visible) {
+      return capture_e::timeout;
+    }
+
+    if (!pull_free_image_cb(img_out)) {
+      return capture_e::interrupted;
+    }
+
+    auto d3d_img = std::static_pointer_cast<img_d3d_t>(img_out);
+    if (complete_img(d3d_img.get(), false)) {
+      return capture_e::error;
+    }
+
+    texture_lock_helper lock_helper(d3d_img->capture_mutex.get());
+    if (!lock_helper.lock()) {
+      BOOST_LOG(error) << "Failed to lock capture texture";
+      return capture_e::error;
+    }
+    d3d_img->blank = false;
+
+    device_ctx->CopyResource(d3d_img->capture_texture.get(), canvas.get());
+
+    const bool blend_mouse_cursor = cursor_visible && cursor_owner >= 0 && (cursor_alpha.visible || cursor_xor.visible);
+    if (blend_mouse_cursor) {
+      device_ctx->VSSetShader(cursor_vs.get(), nullptr, 0);
+      device_ctx->PSSetShader(cursor_ps.get(), nullptr, 0);
+      device_ctx->OMSetRenderTargets(1, &d3d_img->capture_rt, nullptr);
+
+      if (cursor_alpha.texture.get()) {
+        // Perform an alpha blending operation
+        device_ctx->OMSetBlendState(blend_alpha.get(), nullptr, 0xFFFFFFFFu);
+        device_ctx->PSSetShaderResources(0, 1, &cursor_alpha.input_res);
+        device_ctx->RSSetViewports(1, &cursor_alpha.cursor_view);
+        device_ctx->Draw(3, 0);
+      }
+
+      if (cursor_xor.texture.get()) {
+        // Perform an invert blending without touching alpha values
+        device_ctx->OMSetBlendState(blend_invert.get(), nullptr, 0x00FFFFFFu);
+        device_ctx->PSSetShaderResources(0, 1, &cursor_xor.input_res);
+        device_ctx->RSSetViewports(1, &cursor_xor.cursor_view);
+        device_ctx->Draw(3, 0);
+      }
+
+      device_ctx->OMSetBlendState(blend_disable.get(), nullptr, 0xFFFFFFFFu);
+
+      ID3D11RenderTargetView *empty_render_target = nullptr;
+      device_ctx->OMSetRenderTargets(1, &empty_render_target, nullptr);
+      device_ctx->RSSetViewports(0, nullptr);
+      ID3D11ShaderResourceView *empty_shader_resource_view = nullptr;
+      device_ctx->PSSetShaderResources(0, 1, &empty_shader_resource_view);
+    }
+
+    if (latest_qpc) {
+      // Translate QueryPerformanceCounter() value to steady_clock time point
+      img_out->frame_timestamp = std::chrono::steady_clock::now() - qpc_time_difference(qpc_counter(), latest_qpc);
+    } else {
+      img_out->frame_timestamp = std::chrono::steady_clock::now();
+    }
+
+    return capture_e::ok;
+  }
+
+  capture_e display_span_vram_t::release_snapshot() {
+    // Frames are released as soon as they are copied into the canvas.
+    return capture_e::ok;
   }
 
   /**

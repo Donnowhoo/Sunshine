@@ -39,6 +39,7 @@ namespace video {
     int dynamicRange;  ///< Encoding color depth: 0 = 8-bit, 1 = 10-bit.
     int chromaSamplingType;  ///< Chroma sampling type: 0 = 4:2:0, 1 = 4:4:4.
     int enableIntraRefresh;  ///< Intra refresh setting: 0 = disabled, 1 = enabled.
+    int spanDisplays = 0;  ///< Spanned capture: 0 = capture one display, 1 = combine all displays of one GPU into one image.
   };
 
   namespace amf {

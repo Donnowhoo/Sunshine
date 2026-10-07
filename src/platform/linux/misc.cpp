@@ -1319,6 +1319,11 @@ namespace platf {
   }
 #endif
 
+  std::vector<span_rect_t> span_display_layout() {
+    // Spanned multi-monitor capture is only implemented for Windows.
+    return {};
+  }
+
   /**
    * @brief List display names accepted by the selected capture backend.
    */

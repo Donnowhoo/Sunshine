@@ -506,6 +506,10 @@ namespace nvhttp {
     launch_session->continuous_audio = util::from_view(get_arg(args, "continuousAudio", "0"));
     launch_session->gcmap = (int) util::from_view(get_arg(args, "gcmap", "0"));
     launch_session->enable_hdr = util::from_view(get_arg(args, "hdrMode", "0"));
+    launch_session->span_displays = util::from_view(get_arg(args, "sunshineSpanDisplays", "0")) != 0;
+    if (launch_session->span_displays) {
+      BOOST_LOG(info) << "Client requested a spanned capture of all displays"sv;
+    }
 
     // Encrypted RTSP is enabled with client reported corever >= 1
     auto corever = util::from_view(get_arg(args, "corever", "0"));
@@ -1242,6 +1246,12 @@ namespace nvhttp {
     // For HTTP requests, use a placeholder MAC address that Moonlight knows to ignore.
     if constexpr (std::is_same_v<SunshineHTTPS, T>) {
       tree.put("root.mac", platf::get_mac_address(net::addr_to_normalized_string(local_endpoint.address())));
+
+      // Advertise the host display layout to paired clients so they can request a spanned capture.
+      const auto span_layout = platf::span_layout_to_string(platf::span_display_layout());
+      if (!span_layout.empty()) {
+        tree.put("root.SunshineDisplayLayout", span_layout);
+      }
     } else {
       tree.put("root.mac", "00:00:00:00:00:00");
     }
@@ -1392,7 +1402,10 @@ namespace nvhttp {
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
-      display_device::configure_display(config::video, *launch_session);
+      // A spanned capture streams the displays as they are, so their resolution must not be changed.
+      if (!launch_session->span_displays) {
+        display_device::configure_display(config::video, *launch_session);
+      }
 
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
@@ -1504,7 +1517,10 @@ namespace nvhttp {
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
-      display_device::configure_display(config::video, *launch_session);
+      // A spanned capture streams the displays as they are, so their resolution must not be changed.
+      if (!launch_session->span_displays) {
+        display_device::configure_display(config::video, *launch_session);
+      }
 
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed

@@ -3,6 +3,7 @@
  * @brief Definitions for the Windows display base code.
  */
 // standard includes
+#include <algorithm>
 #include <cmath>
 #include <thread>
 
@@ -759,6 +760,75 @@ namespace platf::dxgi {
     return 0;
   }
 
+  std::vector<span_candidate_output_t> find_span_outputs() {
+    factory1_t factory;
+    auto status = CreateDXGIFactory1(IID_IDXGIFactory1, (void **) &factory);
+    if (FAILED(status)) {
+      BOOST_LOG(error) << "Failed to create DXGIFactory1 [0x"sv << util::hex(status).to_string_view() << ']';
+      return {};
+    }
+
+    const auto adapter_name = utf_utils::from_utf8(config::video.adapter_name);
+
+    std::vector<span_candidate_output_t> best;
+    adapter_t::pointer adapter_p;
+    for (int x = 0; factory->EnumAdapters1(x, &adapter_p) != DXGI_ERROR_NOT_FOUND; ++x) {
+      adapter_t adapter {adapter_p};
+
+      DXGI_ADAPTER_DESC1 adapter_desc;
+      adapter->GetDesc1(&adapter_desc);
+      if (!adapter_name.empty() && adapter_desc.Description != adapter_name) {
+        continue;
+      }
+
+      std::vector<span_candidate_output_t> candidates;
+      bool supported = true;
+      output_t::pointer output_p;
+      for (int y = 0; adapter->EnumOutputs(y, &output_p) != DXGI_ERROR_NOT_FOUND; ++y) {
+        output_t output {output_p};
+
+        DXGI_OUTPUT_DESC desc;
+        output->GetDesc(&desc);
+        if (!desc.AttachedToDesktop) {
+          continue;
+        }
+
+        // Rotated displays would need a rotation pass while composing, which is not implemented.
+        if (desc.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED && desc.Rotation != DXGI_MODE_ROTATION_IDENTITY) {
+          supported = false;
+          break;
+        }
+
+        candidates.push_back({desc.DeviceName, desc.DesktopCoordinates});
+      }
+
+      if (supported && candidates.size() > best.size()) {
+        best = std::move(candidates);
+      }
+    }
+
+    if (best.size() < 2) {
+      return {};
+    }
+
+    std::sort(best.begin(), best.end(), [](const span_candidate_output_t &a, const span_candidate_output_t &b) {
+      return a.desktop.left != b.desktop.left ? a.desktop.left < b.desktop.left : a.desktop.top < b.desktop.top;
+    });
+
+    return best;
+  }
+
+  RECT span_bounds(const std::vector<span_candidate_output_t> &outputs) {
+    RECT bounds = outputs.front().desktop;
+    for (const auto &output : outputs) {
+      bounds.left = (std::min)(bounds.left, output.desktop.left);
+      bounds.top = (std::min)(bounds.top, output.desktop.top);
+      bounds.right = (std::max)(bounds.right, output.desktop.right);
+      bounds.bottom = (std::max)(bounds.bottom, output.desktop.bottom);
+    }
+    return bounds;
+  }
+
   bool display_base_t::is_hdr() {
     dxgi::output6_t output6 {};
 
@@ -1016,6 +1086,18 @@ namespace platf {
    * @param hwdevice_type enables possible use of hardware encoder
    */
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
+    if (config.spanDisplays) {
+      if (hwdevice_type == mem_type_e::dxgi && (config::video.capture == "ddx" || config::video.capture.empty())) {
+        auto disp = std::make_shared<dxgi::display_span_vram_t>();
+
+        if (!disp->init(config)) {
+          return disp;
+        }
+      }
+
+      BOOST_LOG(warning) << "Spanned capture is unavailable, capturing a single display instead"sv;
+    }
+
     if (config::video.capture == "ddx" || config::video.capture.empty()) {
       if (hwdevice_type == mem_type_e::dxgi) {
         auto disp = std::make_shared<dxgi::display_ddup_vram_t>();
@@ -1117,6 +1199,26 @@ namespace platf {
     }
 
     return display_names;
+  }
+
+  std::vector<span_rect_t> span_display_layout() {
+    const auto outputs = dxgi::find_span_outputs();
+    if (outputs.empty()) {
+      return {};
+    }
+
+    const auto bounds = dxgi::span_bounds(outputs);
+    std::vector<span_rect_t> layout;
+    layout.reserve(outputs.size());
+    for (const auto &output : outputs) {
+      layout.push_back({
+        static_cast<int>(output.desktop.left - bounds.left),
+        static_cast<int>(output.desktop.top - bounds.top),
+        static_cast<int>(output.desktop.right - output.desktop.left),
+        static_cast<int>(output.desktop.bottom - output.desktop.top),
+      });
+    }
+    return layout;
   }
 
   /**

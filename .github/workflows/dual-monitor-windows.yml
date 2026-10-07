@@ -1,0 +1,25 @@
+---
+# Builds the Windows installer for the dual monitor (spanned capture) branch only.
+name: Dual Monitor Windows Build
+permissions: {}
+
+on:
+  push:
+    branches:
+      - dual-monitor
+  workflow_dispatch:
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    name: Windows
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci-windows.yml
+    with:
+      publish_release: 'false'
+      release_commit: ${{ github.sha }}
+      release_version: '2026.1008.${{ github.run_number }}'
