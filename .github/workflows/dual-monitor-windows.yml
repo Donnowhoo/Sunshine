@@ -23,3 +23,31 @@ jobs:
       publish_release: 'false'
       release_commit: ${{ github.sha }}
       release_version: '2026.1008.${{ github.run_number }}'
+
+  publish:
+    name: Publish installer
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: artifacts
+          pattern: build-Windows-AMD64
+          merge-multiple: true
+
+      - name: Publish dual monitor release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ls -l artifacts
+          gh release delete dual-monitor-latest -R "${{ github.repository }}" --yes --cleanup-tag || true
+          files=$(find artifacts -maxdepth 1 -type f \( -name '*.exe' -o -name '*.msi' -o -name '*.zip' \) ! -name '*debuginfo*')
+          gh release create dual-monitor-latest $files \
+            -R "${{ github.repository }}" \
+            --prerelease \
+            --target "${{ github.sha }}" \
+            --title "Sunshine dual monitor build (${GITHUB_SHA::7})" \
+            --notes "Sunshine with spanned dual monitor capture. Install on the host PC."
