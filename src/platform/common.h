@@ -743,7 +743,8 @@ namespace platf {
   /**
    * @brief Map a point of a spanned image back to host display coordinates.
    *
-   * Points outside every display area are moved to the closest display area first.
+     * Points outside every display area are moved to the closest display area first.
+     * Distances use the last valid pixel, so adjacent displays do not share an edge pixel.
    *
    * @param map Display areas of the spanned image.
    * @param x Horizontal position inside the spanned image.
@@ -754,8 +755,8 @@ namespace platf {
     const span_map_entry_t *best = nullptr;
     float best_distance = 0.0f;
     for (const auto &entry : map) {
-      const float dx = x < entry.dest.x ? entry.dest.x - x : (x > entry.dest.x + entry.dest.width ? x - (entry.dest.x + entry.dest.width) : 0.0f);
-      const float dy = y < entry.dest.y ? entry.dest.y - y : (y > entry.dest.y + entry.dest.height ? y - (entry.dest.y + entry.dest.height) : 0.0f);
+      const float dx = x - std::clamp(x, static_cast<float>(entry.dest.x), static_cast<float>(entry.dest.x + entry.dest.width - 1));
+      const float dy = y - std::clamp(y, static_cast<float>(entry.dest.y), static_cast<float>(entry.dest.y + entry.dest.height - 1));
       const float distance = dx * dx + dy * dy;
       if (!best || distance < best_distance) {
         best = &entry;
