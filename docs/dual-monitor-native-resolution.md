@@ -1,6 +1,18 @@
 # Native resolutions for dual-monitor sessions
 
-Status: local implementation; compilation and runtime verification pending.
+Status: Windows x64 build and automated tests passed for `3dcc8a3a` on
+2026-11-10. Physical monitor and disconnect/recovery testing remain pending.
+
+Build: https://github.com/Donnowhoo/Sunshine/actions/runs/42759779381
+
+The suite passed 691 tests (including all 13 new native-resolution tests) and
+skipped 6 environment-dependent tests. The initial build of `c08dd6ca` failed
+because an exception variable shadowed the error logger; `3dcc8a3a` fixes it.
+Only Windows AMD64 was built. The release targets `3dcc8a3a`.
+
+Installer SHA256:
+`e2351112f92b4d40ebd274847a9b0786c31726a853c996d608feb4f143d33593`.
+This does not resolve the separately reported Chrome Google logout issue.
 
 A paired dual-monitor client already sends individual monitor rectangles. Before
 capture starts, Sunshine matches these to active Windows device IDs and requests
