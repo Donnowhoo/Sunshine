@@ -56,17 +56,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: Windows-AMD64
-            os: windows-2022
-            arch: x86_64
-            msystem: ucrt64
-            toolchain: ucrt-x86_64
-          - name: Windows-ARM64
-            os: windows-11-arm
-            arch: aarch64
-            msystem: clangarm64
-            toolchain: clang-aarch64
+        # The fork's dual-monitor builds only Windows x64; other branches retain both targets.
+        include: ${{ fromJSON(github.ref == 'refs/heads/dual-monitor' && '[{"name":"Windows-AMD64","os":"windows-2022","arch":"x86_64","msystem":"ucrt64","toolchain":"ucrt-x86_64"}]' || '[{"name":"Windows-AMD64","os":"windows-2022","arch":"x86_64","msystem":"ucrt64","toolchain":"ucrt-x86_64"},{"name":"Windows-ARM64","os":"windows-11-arm","arch":"aarch64","msystem":"clangarm64","toolchain":"clang-aarch64"}]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
