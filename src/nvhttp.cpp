@@ -42,6 +42,9 @@
 using namespace std::literals;
 
 namespace nvhttp {
+#ifdef _WIN32
+  std::mutex stream_admission_mutex;  ///< Serializes initial encoder probing with concurrent launch/resume requests.
+#endif
 
   static constexpr std::string_view EMPTY_PROPERTY_TREE_ERROR_MSG = "Property tree is empty. Probably, control flow got interrupted by an unexpected C++ exception. This is a bug in Sunshine. Moonlight-qt will report Malformed XML (missing root element)."sv;
 
@@ -1348,6 +1351,9 @@ namespace nvhttp {
    * @param request HTTP request data from the client.
    */
   void launch(bool &host_audio, resp_https_t response, req_https_t request) {
+#ifdef _WIN32
+    std::lock_guard admission {stream_admission_mutex};
+#endif
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
@@ -1476,6 +1482,9 @@ namespace nvhttp {
    * @param request HTTP request data from the client.
    */
   void resume(bool &host_audio, resp_https_t response, req_https_t request) {
+#ifdef _WIN32
+    std::lock_guard admission {stream_admission_mutex};
+#endif
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
