@@ -691,6 +691,39 @@ namespace platf {
   };
 
   /**
+   * @brief Fit a host image inside one client monitor without changing its aspect ratio.
+   * @param source Host rectangle with positive dimensions.
+   * @param target Client rectangle with positive dimensions.
+   * @return Destination rectangle in client canvas coordinates.
+   */
+  inline span_rect_t span_fit_rect(const span_rect_t &source, const span_rect_t &target) {
+    const double scale = (std::min) (static_cast<double>(target.width) / source.width, static_cast<double>(target.height) / source.height);
+    const int width = (std::max) (1, static_cast<int>(source.width * scale + 0.5));
+    const int height = (std::max) (1, static_cast<int>(source.height * scale + 0.5));
+    return {target.x + (target.width - width) / 2, target.y + (target.height - height) / 2, width, height};
+  }
+
+  /**
+   * @brief Find the canvas bounds of every client monitor, including unused monitors.
+   * @param layout Nonempty client layout with positive dimensions.
+   * @return Bounding rectangle preserving the negotiated canvas during fallback.
+   */
+  inline span_rect_t span_canvas_bounds(const std::vector<span_rect_t> &layout) {
+    auto bounds = layout.front();
+    int right = bounds.x + bounds.width;
+    int bottom = bounds.y + bounds.height;
+    for (const auto &rect : layout) {
+      bounds.x = (std::min) (bounds.x, rect.x);
+      bounds.y = (std::min) (bounds.y, rect.y);
+      right = (std::max) (right, rect.x + rect.width);
+      bottom = (std::max) (bottom, rect.y + rect.height);
+    }
+    bounds.width = right - bounds.x;
+    bounds.height = bottom - bounds.y;
+    return bounds;
+  }
+
+  /**
    * @brief Where one host display is drawn inside a spanned image.
    */
   struct span_map_entry_t {
@@ -743,8 +776,8 @@ namespace platf {
   /**
    * @brief Map a point of a spanned image back to host display coordinates.
    *
-     * Points outside every display area are moved to the closest display area first.
-     * Distances use the last valid pixel, so adjacent displays do not share an edge pixel.
+   * Points outside every display area are moved to the closest display area first.
+   * Distances use the last valid pixel, so adjacent displays do not share an edge pixel.
    *
    * @param map Display areas of the spanned image.
    * @param x Horizontal position inside the spanned image.

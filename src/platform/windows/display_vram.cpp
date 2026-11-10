@@ -5,6 +5,7 @@
 // standard includes
 #include <algorithm>
 #include <cmath>
+#include <thread>
 
 // platform includes
 #include <d3dcompiler.h>
@@ -26,6 +27,7 @@ extern "C" {
 #include "src/logging.h"
 #include "src/nvenc/nvenc_config.h"
 #include "src/nvenc/nvenc_dynamic_factory.h"
+#include "src/span_policy.h"
 #include "src/video.h"
 #include "utf_utils.h"
 
@@ -1845,22 +1847,52 @@ namespace platf::dxgi {
     return 0;
   }
 
+  namespace {
+    std::mutex span_failure_mutex {};  ///< Protects the format-failure topology latch across capture threads.
+    std::wstring span_failed_topology {};  ///< Last topology with incompatible frame formats; cleared on topology change.
+  }  // namespace
+
   int display_span_vram_t::init(const ::video::config_t &config) {
     auto candidates = find_span_outputs();
-
-    // Host displays are paired with the client monitors from left to right.
-    const auto client_layout = span_layout_from_string(config.spanClientLayout);
-    if (!client_layout.empty() && client_layout.size() < candidates.size()) {
-      candidates.resize(client_layout.size());
+    // Enumeration may briefly expose only one output during a hot-plug transition.
+    // Three observations, 250 ms apart, bound the additional settling delay to 500 ms.
+    for (int attempt = 0; attempt < 2 && !span_outputs_compatible(candidates); ++attempt) {
+      std::this_thread::sleep_for(250ms);
+      candidates = find_span_outputs();
+    }
+    topology_key = span_topology_key(candidates);
+    BOOST_LOG(debug) << "Spanned recovery observed "sv << candidates.size() << " attached outputs"sv;
+    next_topology_check = std::chrono::steady_clock::now() + 1s;
+    bool format_blocked = false;
+    {
+      std::lock_guard<std::mutex> lock(span_failure_mutex);
+      format_blocked = platf::span_topology_blocked(topology_key, span_failed_topology);
+      if (!format_blocked) {
+        span_failed_topology.clear();
+      }
     }
 
-    if (candidates.size() < 2) {
-      BOOST_LOG(info) << "Spanned capture needs at least two unrotated displays on one GPU and two client monitors"sv;
-      return -1;
+    // Keep the entire client canvas even when only its first monitor can be filled.
+    const auto client_layout = span_layout_from_string(config.spanClientLayout);
+    const bool single_output = !span_outputs_compatible(candidates) || format_blocked;
+    if (single_output) {
+      const auto usable = std::find_if(candidates.begin(), candidates.end(), [](const auto &candidate) {
+        return candidate.rotation == DXGI_MODE_ROTATION_UNSPECIFIED || candidate.rotation == DXGI_MODE_ROTATION_IDENTITY;
+      });
+      if (usable == candidates.end()) {
+        BOOST_LOG(info) << "Spanned capture has no usable output; waiting for display recovery"sv;
+        return -1;
+      }
+      const auto first = *usable;
+      candidates = {first};
+      BOOST_LOG(info) << "Spanned capture falling back to one output in the first client monitor"sv;
+    } else if (!client_layout.empty() && client_layout.size() < candidates.size()) {
+      candidates.resize(client_layout.size());
     }
 
     // Create the shared D3D device on the GPU of the leftmost display.
     if (display_base_t::init(config, utf_utils::to_utf8(candidates.front().device_name))) {
+      BOOST_LOG(warning) << "Spanned recovery failed to initialize the capture device"sv;
       return -1;
     }
 
@@ -1872,19 +1904,11 @@ namespace platf::dxgi {
     int canvas_right = bounds.right - bounds.left;
     int canvas_bottom = bounds.bottom - bounds.top;
     if (!client_layout.empty()) {
-      client_left = client_layout.front().x;
-      client_top = client_layout.front().y;
-      canvas_right = client_layout.front().x + client_layout.front().width;
-      canvas_bottom = client_layout.front().y + client_layout.front().height;
-      for (std::size_t i = 0; i < candidates.size(); ++i) {
-        const auto &rect = client_layout[i];
-        client_left = (std::min)(client_left, rect.x);
-        client_top = (std::min)(client_top, rect.y);
-        canvas_right = (std::max)(canvas_right, rect.x + rect.width);
-        canvas_bottom = (std::max)(canvas_bottom, rect.y + rect.height);
-      }
-      canvas_right -= client_left;
-      canvas_bottom -= client_top;
+      const auto client_bounds = span_canvas_bounds(client_layout);
+      client_left = client_bounds.x;
+      client_top = client_bounds.y;
+      canvas_right = client_bounds.width;
+      canvas_bottom = client_bounds.height;
     }
 
     // duplication_t::init() duplicates display_base_t::output, so each display is
@@ -1899,12 +1923,20 @@ namespace platf::dxgi {
       const auto &candidate = candidates[i];
 
       output_t found;
-      output_t::pointer output_p {};
-      for (int y = 0; adapter->EnumOutputs(y, &output_p) != DXGI_ERROR_NOT_FOUND; ++y) {
-        output_t output_tmp {output_p};
-
-        DXGI_OUTPUT_DESC desc;
-        output_tmp->GetDesc(&desc);
+      for (UINT y = 0;; ++y) {
+        output_t output_tmp;
+        const auto enum_status = adapter->EnumOutputs(y, &output_tmp);
+        if (enum_status == DXGI_ERROR_NOT_FOUND) {
+          break;
+        }
+        if (FAILED(enum_status)) {
+          BOOST_LOG(warning) << "Spanned output changed during initialization"sv;
+          return -1;
+        }
+        DXGI_OUTPUT_DESC desc {};
+        if (FAILED(output_tmp->GetDesc(&desc))) {
+          return -1;
+        }
         if (candidate.device_name == desc.DeviceName) {
           found.reset(output_tmp.release());
           break;
@@ -1937,16 +1969,9 @@ namespace platf::dxgi {
       } else {
         // Fit the display into its client monitor without distorting it.
         const auto &target = client_layout[i];
-        const auto &source = span_output->source;
-        const double scale = (std::min)(static_cast<double>(target.width) / source.width, static_cast<double>(target.height) / source.height);
-        const int fit_width = (std::max)(1, static_cast<int>(std::lround(source.width * scale)));
-        const int fit_height = (std::max)(1, static_cast<int>(std::lround(source.height * scale)));
-        span_output->rect = {
-          target.x - client_left + (target.width - fit_width) / 2,
-          target.y - client_top + (target.height - fit_height) / 2,
-          fit_width,
-          fit_height,
-        };
+        span_output->rect = span_fit_rect(span_output->source, target);
+        span_output->rect.x -= client_left;
+        span_output->rect.y -= client_top;
       }
 
       span_map.push_back({span_output->rect, span_output->source});
@@ -2078,6 +2103,13 @@ namespace platf::dxgi {
   }
 
   capture_e display_span_vram_t::snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) {
+    if (std::chrono::steady_clock::now() >= next_topology_check) {
+      next_topology_check = std::chrono::steady_clock::now() + 1s;
+      if (span_topology_key(find_span_outputs()) != topology_key) {
+        BOOST_LOG(info) << "Spanned display topology changed; reinitializing capture"sv;
+        return capture_e::reinit;
+      }
+    }
     const auto deadline = std::chrono::steady_clock::now() + timeout;
 
     bool frame_updated = false;
@@ -2100,7 +2132,7 @@ namespace platf::dxgi {
           return capture_status;
         }
 
-        latest_qpc = (std::max)({latest_qpc, frame_info.LastPresentTime.QuadPart, frame_info.LastMouseUpdateTime.QuadPart});
+        latest_qpc = (std::max) ({latest_qpc, frame_info.LastPresentTime.QuadPart, frame_info.LastMouseUpdateTime.QuadPart});
 
         if (frame_info.PointerShapeBufferSize > 0) {
           DXGI_OUTDUPL_POINTER_SHAPE_INFO shape_info {};
@@ -2172,10 +2204,13 @@ namespace platf::dxgi {
           }
 
           if (capture_format != desc.Format) {
-            // Displays of a span must share one format. This happens when only some
-            // of them have HDR enabled.
-            BOOST_LOG(error) << "Spanned displays use different capture formats ["sv << dxgi_format_to_string(capture_format) << " and "sv << dxgi_format_to_string(desc.Format) << "]. Enable or disable HDR on all displays."sv;
-            return capture_e::error;
+            // Latch this topology so equal reported color spaces cannot cause a reinit loop.
+            {
+              std::lock_guard<std::mutex> lock(span_failure_mutex);
+              span_failed_topology = topology_key;
+            }
+            BOOST_LOG(warning) << "Spanned displays use different capture formats; reinitializing into one output"sv;
+            return capture_e::reinit;
           }
 
           if (!ensure_canvas()) {

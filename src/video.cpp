@@ -1587,6 +1587,8 @@ namespace video {
       return;
     }
     capture_ctxs.emplace_back(std::move(*initial_capture_ctx));
+    // Preserve the dual session configuration while closed contexts are removed during reinit.
+    const auto span_recovery_config = capture_ctxs.front().config;
 
     // Get all the monitor names now, rather than at boot, to
     // get the most up-to-date list available monitors
@@ -1594,6 +1596,12 @@ namespace video {
     int display_p = -1;
     refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
     auto disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
+    if (span_recovery_config.spanDisplays) {
+      while (!disp && capture_ctx_queue->running() && capture_ctxs.front().images->running()) {
+        refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+        reset_display(disp, encoder.platform_formats->dev_type, display_names[display_p], span_recovery_config);
+      }
+    }
     if (!disp) {
       return;
     }
@@ -1776,6 +1784,12 @@ namespace video {
             }
 
             while (capture_ctx_queue->running()) {
+              if (span_recovery_config.spanDisplays && (capture_ctxs.empty() || std::none_of(capture_ctxs.begin(), capture_ctxs.end(), [](const auto &ctx) {
+                                                          return ctx.images->running();
+                                                        }))) {
+                BOOST_LOG(info) << "Spanned capture recovery stopped: no active capture contexts"sv;
+                return;
+              }
               // Release the display before reenumerating displays, since some capture backends
               // only support a single display session per device/application.
               disp.reset();
@@ -1789,7 +1803,7 @@ namespace video {
               }
 
               // reset_display() will sleep between retries
-              reset_display(disp, encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
+              reset_display(disp, encoder.platform_formats->dev_type, display_names[display_p], span_recovery_config.spanDisplays ? span_recovery_config : capture_ctxs.front().config);
               if (disp) {
                 break;
               }

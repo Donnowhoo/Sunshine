@@ -5,6 +5,7 @@
 // standard includes
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <thread>
 
 // platform includes
@@ -46,6 +47,7 @@ typedef enum _D3DKMT_GPU_PREFERENCE_QUERY_STATE : DWORD {
 #include "src/display_device.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
+#include "src/span_policy.h"
 #include "src/video.h"
 
 namespace platf {
@@ -130,6 +132,10 @@ namespace platf::dxgi {
     BOOST_LOG(info) << "Desktop resolution ["sv << dup_desc.ModeDesc.Width << 'x' << dup_desc.ModeDesc.Height << ']';
     BOOST_LOG(info) << "Desktop format ["sv << display->dxgi_format_to_string(dup_desc.ModeDesc.Format) << ']';
 
+    if (config.spanDisplays && !platf::span_refresh_rate_valid(dup_desc.ModeDesc.RefreshRate.Numerator, dup_desc.ModeDesc.RefreshRate.Denominator)) {
+      BOOST_LOG(warning) << "Spanned output has a transient invalid refresh rate; retrying initialization"sv;
+      return -1;
+    }
     display->display_refresh_rate = dup_desc.ModeDesc.RefreshRate;
     double display_refresh_rate_decimal = (double) display->display_refresh_rate.Numerator / display->display_refresh_rate.Denominator;
     BOOST_LOG(info) << "Display refresh rate [" << display_refresh_rate_decimal << "Hz]";
@@ -771,44 +777,53 @@ namespace platf::dxgi {
     const auto adapter_name = utf_utils::from_utf8(config::video.adapter_name);
 
     std::vector<span_candidate_output_t> best;
-    adapter_t::pointer adapter_p;
-    for (int x = 0; factory->EnumAdapters1(x, &adapter_p) != DXGI_ERROR_NOT_FOUND; ++x) {
-      adapter_t adapter {adapter_p};
-
-      DXGI_ADAPTER_DESC1 adapter_desc;
-      adapter->GetDesc1(&adapter_desc);
+    for (UINT x = 0;; ++x) {
+      adapter_t adapter;
+      const auto adapter_status = factory->EnumAdapters1(x, &adapter);
+      if (adapter_status == DXGI_ERROR_NOT_FOUND) {
+        break;
+      }
+      if (FAILED(adapter_status)) {
+        BOOST_LOG(warning) << "Spanned adapter enumeration changed; retrying later"sv;
+        return {};
+      }
+      DXGI_ADAPTER_DESC1 adapter_desc {};
+      if (FAILED(adapter->GetDesc1(&adapter_desc))) {
+        return {};
+      }
       if (!adapter_name.empty() && adapter_desc.Description != adapter_name) {
         continue;
       }
 
       std::vector<span_candidate_output_t> candidates;
-      bool supported = true;
-      output_t::pointer output_p;
-      for (int y = 0; adapter->EnumOutputs(y, &output_p) != DXGI_ERROR_NOT_FOUND; ++y) {
-        output_t output {output_p};
-
-        DXGI_OUTPUT_DESC desc;
-        output->GetDesc(&desc);
-        if (!desc.AttachedToDesktop) {
+      for (UINT y = 0;; ++y) {
+        output_t output;
+        const auto output_status = adapter->EnumOutputs(y, &output);
+        if (output_status == DXGI_ERROR_NOT_FOUND) {
+          break;
+        }
+        if (FAILED(output_status)) {
+          BOOST_LOG(warning) << "Spanned output enumeration changed; retrying later"sv;
+          return {};
+        }
+        DXGI_OUTPUT_DESC desc {};
+        if (FAILED(output->GetDesc(&desc))) {
+          return {};
+        }
+        if (!desc.AttachedToDesktop || desc.DesktopCoordinates.right <= desc.DesktopCoordinates.left || desc.DesktopCoordinates.bottom <= desc.DesktopCoordinates.top) {
           continue;
         }
 
-        // Rotated displays would need a rotation pass while composing, which is not implemented.
-        if (desc.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED && desc.Rotation != DXGI_MODE_ROTATION_IDENTITY) {
-          supported = false;
-          break;
-        }
-
-        candidates.push_back({desc.DeviceName, desc.DesktopCoordinates});
+        output6_t output6 {};
+        DXGI_OUTPUT_DESC1 desc1 {};
+        const bool known = SUCCEEDED(output->QueryInterface(IID_IDXGIOutput6, (void **) &output6)) &&
+                           SUCCEEDED(output6->GetDesc1(&desc1));
+        candidates.push_back({desc.DeviceName, desc.DesktopCoordinates, desc.Rotation, desc1.ColorSpace, known});
       }
 
-      if (supported && candidates.size() > best.size()) {
+      if (candidates.size() > best.size()) {
         best = std::move(candidates);
       }
-    }
-
-    if (best.size() < 2) {
-      return {};
     }
 
     std::sort(best.begin(), best.end(), [](const span_candidate_output_t &a, const span_candidate_output_t &b) {
@@ -818,13 +833,32 @@ namespace platf::dxgi {
     return best;
   }
 
+  bool span_outputs_compatible(const std::vector<span_candidate_output_t> &outputs) {
+    std::vector<platf::span_output_state_t> states;
+    for (const auto &output : outputs) {
+      states.push_back({output.rotation == DXGI_MODE_ROTATION_UNSPECIFIED || output.rotation == DXGI_MODE_ROTATION_IDENTITY, output.color_space_known, static_cast<unsigned int>(output.color_space)});
+    }
+    return platf::span_outputs_supported(states);
+  }
+
+  std::wstring span_topology_key(const std::vector<span_candidate_output_t> &outputs) {
+    std::wstring key;
+    for (const auto &output : outputs) {
+      key += output.device_name + L":" + std::to_wstring(output.desktop.left) + L"," +
+             std::to_wstring(output.desktop.top) + L"," + std::to_wstring(output.desktop.right) + L"," +
+             std::to_wstring(output.desktop.bottom) + L"," + std::to_wstring(output.rotation) + L"," +
+             std::to_wstring(output.color_space) + L"," + std::to_wstring(output.color_space_known) + L";";
+    }
+    return key;
+  }
+
   RECT span_bounds(const std::vector<span_candidate_output_t> &outputs) {
     RECT bounds = outputs.front().desktop;
     for (const auto &output : outputs) {
-      bounds.left = (std::min)(bounds.left, output.desktop.left);
-      bounds.top = (std::min)(bounds.top, output.desktop.top);
-      bounds.right = (std::max)(bounds.right, output.desktop.right);
-      bounds.bottom = (std::max)(bounds.bottom, output.desktop.bottom);
+      bounds.left = (std::min) (bounds.left, output.desktop.left);
+      bounds.top = (std::min) (bounds.top, output.desktop.top);
+      bounds.right = (std::max) (bounds.right, output.desktop.right);
+      bounds.bottom = (std::max) (bounds.bottom, output.desktop.bottom);
     }
     return bounds;
   }
@@ -1088,11 +1122,17 @@ namespace platf {
   std::shared_ptr<display_t> display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config) {
     if (config.spanDisplays) {
       if (hwdevice_type == mem_type_e::dxgi && (config::video.capture == "ddx" || config::video.capture.empty())) {
-        auto disp = std::make_shared<dxgi::display_span_vram_t>();
-
-        if (!disp->init(config)) {
-          return disp;
+        try {
+          auto disp = std::make_shared<dxgi::display_span_vram_t>();
+          if (!disp->init(config)) {
+            return disp;
+          }
+        } catch (const std::exception &exception) {
+          BOOST_LOG(error) << "Spanned capture initialization exception: "sv << exception.what();
         }
+        // Keep retrying through the caller rather than switching to a centered single-display image.
+        BOOST_LOG(info) << "Spanned capture is waiting for a usable output"sv;
+        return nullptr;
       }
 
       BOOST_LOG(warning) << "Spanned capture is unavailable, capturing a single display instead"sv;
@@ -1203,7 +1243,7 @@ namespace platf {
 
   std::vector<span_rect_t> span_display_layout() {
     const auto outputs = dxgi::find_span_outputs();
-    if (outputs.empty()) {
+    if (!dxgi::span_outputs_compatible(outputs)) {
       return {};
     }
 

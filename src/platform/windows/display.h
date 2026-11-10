@@ -191,17 +191,34 @@ namespace platf::dxgi {
    */
   struct span_candidate_output_t {
     std::wstring device_name;  ///< DXGI device name of the display.
-    RECT desktop;  ///< Desktop coordinates of the display.
+    RECT desktop {};  ///< Desktop coordinates of the display.
+    DXGI_MODE_ROTATION rotation {};  ///< Rotation reported by DXGI.
+    DXGI_COLOR_SPACE_TYPE color_space {};  ///< Color space reported by IDXGIOutput6.
+    bool color_space_known {};  ///< Whether the color space query succeeded.
   };
 
   /**
    * @brief Find the displays of the GPU that should be combined into a spanned capture.
    *
-   * The GPU with the most attached displays is used. Rotated displays are not supported.
+   * The GPU with the most attached displays is used. Capabilities are checked separately.
    *
-   * @return Displays sorted from left to right, or an empty list when spanned capture is unsupported.
+   * @return Attached displays sorted from left to right, or an empty list on enumeration failure.
    */
   std::vector<span_candidate_output_t> find_span_outputs();
+
+  /**
+   * @brief Check whether all enumerated outputs can share a spanned capture.
+   * @param outputs Attached outputs on one adapter.
+   * @return True for at least two unrotated outputs with a known common color space.
+   */
+  bool span_outputs_compatible(const std::vector<span_candidate_output_t> &outputs);
+
+  /**
+   * @brief Encode the observed topology for change detection and format-failure latching.
+   * @param outputs Outputs including names, rectangles, rotations and color spaces.
+   * @return Stable topology identity.
+   */
+  std::wstring span_topology_key(const std::vector<span_candidate_output_t> &outputs);
 
   /**
    * @brief Compute the bounding box of the given displays in desktop coordinates.
@@ -784,6 +801,8 @@ namespace platf::dxgi {
     render_target_t canvas_rt;  ///< Render target used to clear and draw into the canvas.
     ps_t frame_ps;  ///< Pixel shader that copies a display frame into a scaled area of the canvas.
     int cursor_owner = -1;  ///< Index of the display that currently shows the mouse cursor, or -1.
+    std::wstring topology_key {};  ///< Complete topology seen before selecting capture outputs.
+    std::chrono::steady_clock::time_point next_topology_check {};  ///< Earliest time for another topology query.
 
   private:
     /**
