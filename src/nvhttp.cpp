@@ -1396,18 +1396,24 @@ namespace nvhttp {
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     auto launch_session = make_launch_session(host_audio, args);
 
-    if (rtsp_stream::session_count() == 0) {
+    bool first_display_session {rtsp_stream::session_count() == 0};
+#ifdef _WIN32
+    launch_session->display_lease = display_device::acquire_session_display(config::video, *launch_session, first_display_session);
+#endif
+    if (first_display_session) {
       // The display should be restored in case something fails as there are no other sessions.
       revert_display_configuration = true;
 
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
+#ifndef _WIN32
       if (!launch_session->span_displays) {
         display_device::configure_display(config::video, *launch_session);
       } else {
         display_device::configure_span_displays(*launch_session);
       }
+#endif
 
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
@@ -1519,16 +1525,23 @@ namespace nvhttp {
     }
     const auto launch_session = make_launch_session(host_audio, args);
 
-    if (no_active_sessions) {
+    bool first_display_session {no_active_sessions};
+#ifdef _WIN32
+    launch_session->display_lease = display_device::acquire_session_display(config::video, *launch_session, first_display_session);
+#endif
+    if (first_display_session) {
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
+      revert_native_span = launch_session->span_displays;
+#ifndef _WIN32
       if (!launch_session->span_displays) {
         display_device::configure_display(config::video, *launch_session);
       } else {
         revert_native_span = true;
         display_device::configure_span_displays(*launch_session);
       }
+#endif
 
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed

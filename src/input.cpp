@@ -323,6 +323,7 @@ namespace input {
     std::unique_ptr<platf::client_input_t> client_context;  ///< Client context.
 
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event;  ///< Touch port event.
+    safe::mail_raw_t::event_t<int> switch_display_event {};  ///< Session-local display selection on Windows.
     platf::feedback_queue_t feedback_queue;  ///< Queue used to deliver controller feedback to the platform backend.
 
     std::list<std::vector<uint8_t>> input_queue;  ///< Validated input packets waiting for processing.
@@ -433,6 +434,7 @@ namespace input {
    */
   void rebind_input(const std::shared_ptr<input_t> &input, const safe::mail_t &mail) {
     input->touch_port_event = mail->event<input::touch_port_t>(mail::touch_port);
+    input->switch_display_event = mail->event<int>(mail::switch_display);
     input->feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);
 
     for (int client_index = 0; client_index < input->gamepads.size(); ++client_index) {
@@ -451,16 +453,23 @@ namespace input {
   /**
    * @brief Apply shortcut based on VKEY
    * @param keyCode The VKEY code
+   * @param input Client owning the shortcut.
    * @return 0 if no shortcut applied, > 0 if shortcut applied.
    */
-  inline int apply_shortcut(short keyCode) {
+  inline int apply_shortcut(short keyCode, [[maybe_unused]] input_t &input) {
     constexpr auto VK_F1 = 0x70;
     constexpr auto VK_F13 = 0x7C;
 
     BOOST_LOG(debug) << "Apply Shortcut: 0x"sv << util::hex((std::uint8_t) keyCode).to_string_view();
 
     if (keyCode >= VK_F1 && keyCode <= VK_F13) {
+#ifdef _WIN32
+      if (input.switch_display_event) {
+        input.switch_display_event->raise(keyCode - VK_F1);
+      }
+#else
       mail::man->event<int>(mail::switch_display)->raise(keyCode - VK_F1);
+#endif
       return 1;
     }
 
@@ -1222,7 +1231,7 @@ namespace input {
       if (!release) {
         // A new key has been pressed down, we need to check for key combo's
         // If a key-combo has been pressed down, don't pass it through
-        if (input->shortcutFlags == input_t::SHORTCUT && apply_shortcut(keyCode) > 0) {
+        if (input->shortcutFlags == input_t::SHORTCUT && apply_shortcut(keyCode, *input) > 0) {
           return;
         }
 
@@ -2426,6 +2435,7 @@ namespace input {
           mail->event<input::touch_port_t>(mail::touch_port),
           mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback)
         );
+        input->switch_display_event = mail->event<int>(mail::switch_display);
         state.inputs.try_emplace(std::move(session_id), input);
       }
     }

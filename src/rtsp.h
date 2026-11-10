@@ -11,6 +11,10 @@
 #include "crypto.h"
 #include "thread_safe.h"
 
+namespace platf {
+  class deinit_t;
+}
+
 namespace rtsp_stream {
   constexpr auto RTSP_SETUP_PORT = 21;  ///< GameStream base-port offset used for the RTSP setup listener.
 
@@ -40,6 +44,7 @@ namespace rtsp_stream {
     bool enable_sops;  ///< Whether sequence output protection is requested.
     bool span_displays = false;  ///< Whether the client requested one image spanning all host displays.
     std::string span_client_layout;  ///< Client monitor layout used to arrange a spanned capture.
+    std::shared_ptr<platf::deinit_t> display_lease {};  ///< Keeps physical modes fixed during preparation and capture.
     std::string client_name;  ///< Friendly client name from initial pairing.
 
     std::optional<crypto::cipher::gcm_t> rtsp_cipher;  ///< AES-GCM cipher used once encrypted RTSP is negotiated.

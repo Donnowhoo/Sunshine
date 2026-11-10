@@ -663,6 +663,7 @@ namespace video {
    * @brief Asynchronous capture thread state.
    */
   struct capture_thread_async_ctx_t {
+    safe::mail_raw_t::event_t<int> switch_display_event {};  ///< Display selection owned by this capture group.
     std::shared_ptr<safe::queue_t<capture_ctx_t>> capture_ctx_queue;  ///< Capture ctx queue.
     std::jthread capture_thread;  ///< Capture thread.
 
@@ -676,6 +677,8 @@ namespace video {
    */
   struct capture_thread_sync_ctx_t {
     encode_session_ctx_queue_t encode_session_ctx_queue {30};  ///< Encode session ctx queue.
+    safe::mail_raw_t::event_t<int> switch_display_event {};  ///< Display selection owned by this capture group.
+    std::jthread capture_thread {};  ///< Worker joined before destroying its queue.
   };
 
   /**
@@ -1558,12 +1561,14 @@ namespace video {
    * @param display_wp Weak pointer holder for the active display.
    * @param reinit_event Signal raised while the display is being reinitialized.
    * @param encoder Selected encoder.
+   * @param switch_display_event Display selection for this capture group.
    */
   void captureThread(
     std::shared_ptr<safe::queue_t<capture_ctx_t>> capture_ctx_queue,
     sync_util::sync_t<std::weak_ptr<platf::display_t>> &display_wp,
     safe::signal_t &reinit_event,
-    const encoder_t &encoder
+    const encoder_t &encoder,
+    safe::mail_raw_t::event_t<int> switch_display_event
   ) {
     std::vector<capture_ctx_t> capture_ctxs;
 
@@ -1578,8 +1583,6 @@ namespace video {
         capture_ctx.images->stop();
       }
     });
-
-    auto switch_display_event = mail::man->event<int>(mail::switch_display);
 
     // Wait for the initial capture context or a request to stop the queue
     auto initial_capture_ctx = capture_ctx_queue->pop();
@@ -2697,19 +2700,19 @@ namespace video {
    * @param encode_session_ctx_queue Pending synchronized session context queue.
    * @param display_names Cached display names.
    * @param display_p Active display index.
+   * @param switch_display_event Display selection for this capture group.
    * @return Encoder loop result.
    */
   encode_e encode_run_sync(
     std::vector<std::unique_ptr<sync_session_ctx_t>> &synced_session_ctxs,
     encode_session_ctx_queue_t &encode_session_ctx_queue,
     std::vector<std::string> &display_names,
-    int &display_p
+    int &display_p,
+    safe::mail_raw_t::event_t<int> switch_display_event
   ) {
     const auto &encoder = *chosen_encoder;
 
     std::shared_ptr<platf::display_t> disp;
-
-    auto switch_display_event = mail::man->event<int>(mail::switch_display);
 
     if (synced_session_ctxs.empty()) {
       auto ctx = encode_session_ctx_queue.pop();
@@ -2852,13 +2855,12 @@ namespace video {
 
   /**
    * @brief Run synchronous capture and encode work on the capture thread.
+   * @param capture_ctx Worker state kept alive until this thread is joined.
    */
-  void captureThreadSync() {
-    auto ref = capture_thread_sync.ref();
-
+  void captureThreadSync(capture_thread_sync_ctx_t &capture_ctx) {
     std::vector<std::unique_ptr<sync_session_ctx_t>> synced_session_ctxs;
 
-    auto &ctx = ref->encode_session_ctx_queue;
+    auto &ctx = capture_ctx.encode_session_ctx_queue;
     auto lg = util::fail_guard([&]() {
       ctx.stop();
 
@@ -2879,7 +2881,7 @@ namespace video {
 
     std::vector<std::string> display_names;
     int display_p = -1;
-    while (encode_run_sync(synced_session_ctxs, ctx, display_names, display_p) == encode_e::reinit) {}
+    while (encode_run_sync(synced_session_ctxs, ctx, display_names, display_p, capture_ctx.switch_display_event) == encode_e::reinit) {}
   }
 
   /**
@@ -2902,7 +2904,18 @@ namespace video {
       shutdown_event->raise(true);
     });
 
+#ifdef _WIN32
+    // Each Windows connection owns its capture configuration and display selection.
+    // A single client must never inherit another client's spanned canvas.
+    auto isolated_capture = safe::make_shared<capture_thread_async_ctx_t>([&mail](auto &ctx) {
+      ctx.switch_display_event = mail->event<int>(mail::switch_display);
+      return start_capture_async(ctx);
+    },
+                                                                          end_capture_async);
+    auto ref = isolated_capture.ref();
+#else
     auto ref = capture_thread_async.ref();
+#endif
     if (!ref) {
       return;
     }
@@ -2994,7 +3007,16 @@ namespace video {
       capture_async(std::move(mail), config, channel_data);
     } else {
       safe::signal_t join_event;
+#ifdef _WIN32
+      auto isolated_capture = safe::make_shared<capture_thread_sync_ctx_t>([&mail](auto &ctx) {
+        ctx.switch_display_event = mail->event<int>(mail::switch_display);
+        return start_capture_sync(ctx);
+      },
+                                                                           end_capture_sync);
+      auto ref = isolated_capture.ref();
+#else
       auto ref = capture_thread_sync.ref();
+#endif
       ref->encode_session_ctx_queue.raise(sync_session_ctx_t {
         &join_event,
         mail->event<bool>(mail::shutdown),
@@ -3668,6 +3690,9 @@ namespace video {
    * @brief Start capture async.
    */
   int start_capture_async(capture_thread_async_ctx_t &capture_thread_ctx) {
+    if (!capture_thread_ctx.switch_display_event) {
+      capture_thread_ctx.switch_display_event = mail::man->event<int>(mail::switch_display);
+    }
     capture_thread_ctx.encoder_p = chosen_encoder;
     capture_thread_ctx.reinit_event.reset();
 
@@ -3678,7 +3703,8 @@ namespace video {
       capture_thread_ctx.capture_ctx_queue,
       std::ref(capture_thread_ctx.display_wp),
       std::ref(capture_thread_ctx.reinit_event),
-      std::ref(*capture_thread_ctx.encoder_p)
+      std::ref(*capture_thread_ctx.encoder_p),
+      capture_thread_ctx.switch_display_event
     };
 
     return 0;
@@ -3697,7 +3723,10 @@ namespace video {
    * @brief Start capture sync.
    */
   int start_capture_sync(capture_thread_sync_ctx_t &ctx) {
-    std::jthread {&captureThreadSync}.detach();
+    if (!ctx.switch_display_event) {
+      ctx.switch_display_event = mail::man->event<int>(mail::switch_display);
+    }
+    ctx.capture_thread = std::jthread {&captureThreadSync, std::ref(ctx)};
     return 0;
   }
 
@@ -3705,6 +3734,8 @@ namespace video {
    * @brief Stop capture sync processing.
    */
   void end_capture_sync(capture_thread_sync_ctx_t &ctx) {
+    ctx.encode_session_ctx_queue.stop();
+    ctx.capture_thread.join();
   }
 
   /**

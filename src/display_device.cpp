@@ -22,6 +22,7 @@
 
 // local includes
 #include "audio.h"
+#include "display_session_policy.h"
 #include "native_resolution.h"
 #include "platform/common.h"
 #include "rtsp.h"
@@ -59,6 +60,12 @@ namespace display_device {
       PersistentState *native_state {nullptr};  ///< Borrowed state, protected by the scheduler lock.
 #endif
     } DD_DATA;
+
+    /** @brief Serialize display preparation and last-session recovery, including pending handshakes. */
+    struct {
+      std::recursive_mutex mutex {};  ///< Allows preparation to request recovery through existing APIs.
+      display_session_policy_t policy {};  ///< Admission and deferred recovery state.
+    } DISPLAY_SESSIONS;
 
     /**
      * @brief Helper class for capturing audio context when the API demands it.
@@ -912,7 +919,61 @@ namespace display_device {
 #endif
   }
 
+  std::shared_ptr<platf::deinit_t> acquire_session_display(const config::video_t &video_config, const rtsp_stream::launch_session_t &session, bool &first) {
+    std::lock_guard admission {DISPLAY_SESSIONS.mutex};
+
+    class lease_t final: public platf::deinit_t {
+    public:
+      bool armed {};  ///< Whether this lease owns a reservation.
+
+      ~lease_t() override {
+        if (!armed) {
+          return;
+        }
+        std::lock_guard admission {DISPLAY_SESSIONS.mutex};
+        if (!DISPLAY_SESSIONS.policy.release()) {
+          return;
+        }
+        std::lock_guard lock {DD_DATA.mutex};
+        if (DISPLAY_SESSIONS.policy.revert_requested || DD_DATA.native_span_active) {
+          const auto option = DD_DATA.native_span_active ? revert_option_e::try_indefinitely : revert_option_e::try_indefinitely_with_delay;
+          DISPLAY_SESSIONS.policy.revert_requested = false;
+          try {
+            revert_configuration_unlocked(option);
+          } catch (const std::exception &err) {
+            BOOST_LOG(error) << "Deferred display recovery failed: " << err.what();
+          }
+        }
+      }
+    };
+
+    auto lease = std::make_shared<lease_t>();
+    first = DISPLAY_SESSIONS.policy.can_prepare();
+    if (first) {
+      if (session.span_displays) {
+        configure_span_displays(session);
+      } else {
+        configure_display(video_config, session);
+      }
+    }
+    // Freeze pending background changes before handing the connection to capture.
+    // This also prevents a delayed restoration from an earlier session affecting it.
+    {
+      std::lock_guard lock {DD_DATA.mutex};
+      if (DD_DATA.sm_instance) {
+        DD_DATA.sm_instance->stop();
+      }
+    }
+    DISPLAY_SESSIONS.policy.acquire(session.span_displays);
+    lease->armed = true;
+    return lease;
+  }
+
   void revert_span_configuration() {
+    std::lock_guard admission {DISPLAY_SESSIONS.mutex};
+    if (!DISPLAY_SESSIONS.policy.can_prepare()) {
+      return;
+    }
     std::lock_guard lock {DD_DATA.mutex};
     if (DD_DATA.native_span_active) {
       revert_configuration_unlocked(revert_option_e::try_indefinitely);
@@ -951,6 +1012,11 @@ namespace display_device {
   }
 
   void revert_configuration() {
+    std::lock_guard admission {DISPLAY_SESSIONS.mutex};
+    if (!DISPLAY_SESSIONS.policy.can_prepare()) {
+      DISPLAY_SESSIONS.policy.revert_requested = true;
+      return;
+    }
     std::lock_guard lock {DD_DATA.mutex};
     revert_configuration_unlocked(revert_option_e::try_indefinitely_with_delay);
   }

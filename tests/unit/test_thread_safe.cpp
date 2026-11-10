@@ -15,6 +15,43 @@
 
 static_assert(!std::is_convertible_v<std::uint32_t, safe::queue_t<int>>);
 
+TEST(ThreadSafeShared, StackOwnersInitializeAndReleaseIndependently) {
+  int created_a = 0;
+  int destroyed_a = 0;
+  int created_b = 0;
+  int destroyed_b = 0;
+  auto a = safe::make_shared<int>([&](int &value) {
+    ++created_a;
+    value = 1;
+    return 0;
+  },
+                                  [&](int &) {
+                                    ++destroyed_a;
+                                  });
+  auto b = safe::make_shared<int>([&](int &value) {
+    ++created_b;
+    value = 2;
+    return 0;
+  },
+                                  [&](int &) {
+                                    ++destroyed_b;
+                                  });
+  {
+    auto one = a.ref();
+    auto two = b.ref();
+    auto another = a.ref();
+    EXPECT_EQ(*one.get(), 1);
+    EXPECT_EQ(*two.get(), 2);
+    one.release();
+    EXPECT_EQ(destroyed_a, 0);
+    EXPECT_EQ(*another.get(), 1);
+  }
+  EXPECT_EQ(created_a, 1);
+  EXPECT_EQ(created_b, 1);
+  EXPECT_EQ(destroyed_a, 1);
+  EXPECT_EQ(destroyed_b, 1);
+}
+
 TEST(ThreadSafeQueue, RejectsNewestItemAtCapacity) {
   safe::queue_t<int> queue {1, safe::queue_t<int>::overflow_policy_e::reject};
 

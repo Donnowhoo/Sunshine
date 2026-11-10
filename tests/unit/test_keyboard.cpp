@@ -34,6 +34,7 @@
 
 // local includes
 #include "src/config.h"
+#include "src/globals.h"
 #include "src/input.h"
 #include "src/platform/virtualhid_input.h"
 
@@ -344,7 +345,7 @@ namespace {
       });
 
       static int session = 0;
-      stream_ = input::alloc(std::make_shared<safe::mail_raw_t>(), std::format("keyboard-test-{}", ++session));
+      stream_ = input::alloc(mail_, std::format("keyboard-test-{}", ++session));
       ASSERT_NE(stream_, nullptr);
     }
 
@@ -427,7 +428,13 @@ namespace {
       return *context_->keyboard;
     }
 
+    /** @brief Return this connection's display-selection event. */
+    auto display_event() {
+      return mail_->event<int>(mail::switch_display);
+    }
+
   private:
+    safe::mail_t mail_ = std::make_shared<safe::mail_raw_t>();  ///< Per-test connection mailbox.
     std::shared_ptr<input::input_t> stream_;  ///< Stream input state under test.
     std::vector<input::testing::keyboard_event_t> events_;  ///< Keyboard output recorded for the current test.
     platf::virtualhid::input_context_t *context_ = nullptr;  ///< Fake input context installed in the global backend.
@@ -861,6 +868,24 @@ TEST_F(KeyboardPassthroughTest, SwallowsDisplaySwitchShortcutWhileAllModifiersAr
   release(VKEY_A, all);
   EXPECT_EQ(taken(), (std::vector<std::string> {pressed(VKEY_A), released(VKEY_A)}));
 }
+
+#ifdef _WIN32
+TEST_F(KeyboardPassthroughTest, DisplayShortcutDoesNotReachOtherConnections) {
+  auto own = display_event();
+  auto other_mail = std::make_shared<safe::mail_raw_t>();
+  auto other = other_mail->event<int>(mail::switch_display);
+  auto global = mail::man->event<int>(mail::switch_display);
+  global->reset();
+  press(VKEY_LCONTROL, MODIFIER_CTRL);
+  press(VKEY_LMENU, MODIFIER_CTRL | MODIFIER_ALT);
+  press(VKEY_LSHIFT, MODIFIER_CTRL | MODIFIER_ALT | MODIFIER_SHIFT);
+  press(VKEY_F1, MODIFIER_CTRL | MODIFIER_ALT | MODIFIER_SHIFT);
+  ASSERT_TRUE(own->peek());
+  EXPECT_EQ(*own->pop(), 0);
+  EXPECT_FALSE(other->peek());
+  EXPECT_FALSE(global->peek());
+}
+#endif
 
 TEST_F(KeyboardPassthroughTest, DeliversKeysThroughTheVirtualKeyboard) {
   // Drop the recorder so the events travel the real path into libvirtualhid's fake backend.

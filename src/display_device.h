@@ -29,6 +29,14 @@ namespace rtsp_stream {
 
 namespace display_device {
   /**
+   * @brief Reserve physical display settings through connection setup and streaming.
+   * @param video_config Host display configuration.
+   * @param session Client launch request.
+   * @param first Receives whether this is the first reservation.
+   * @return Shared lease; release after the owning video stream has stopped.
+   */
+  std::shared_ptr<platf::deinit_t> acquire_session_display(const config::video_t &video_config, const rtsp_stream::launch_session_t &session, bool &first);
+  /**
    * @brief Initialize the implementation and perform the initial state recovery (if needed).
    * @param persistence_filepath File location for reading/saving persistent state.
    * @param video_config User's video related configuration.
