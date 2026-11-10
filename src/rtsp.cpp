@@ -23,6 +23,7 @@ extern "C" {
 
 // local includes
 #include "config.h"
+#include "display_device.h"
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
@@ -608,6 +609,9 @@ namespace rtsp_stream {
           auto discarded = launch_event.pop(0s);
           if (discarded) {
             BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
+            if (session_count() == 0) {
+              display_device::revert_span_configuration();
+            }
           }
         }
       });
@@ -1308,6 +1312,9 @@ namespace rtsp_stream {
       BOOST_LOG(error) << "Failed to start a streaming session"sv;
 
       server->remove(stream_session);
+      if (server->session_count() == 0) {
+        display_device::revert_span_configuration();
+      }
       respond(sock, session, &option, 500, "Internal Server Error", req->sequenceNumber, {});
       return;
     }

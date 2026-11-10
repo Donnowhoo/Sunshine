@@ -85,6 +85,18 @@ namespace display_device {
   void configure_display(const config::video_t &video_config, const rtsp_stream::launch_session_t &session);
 
   /**
+   * @brief Match native host resolutions to a dual client's monitors, preserving recovery state.
+   * @param session Dual launch request; caller must ensure no other sessions exist.
+   * @note Failures retain the existing capture fallback instead of blocking remote access.
+   */
+  void configure_span_displays(const rtsp_stream::launch_session_t &session);
+
+  /**
+   * @brief Restore native span modes at the last disconnect or failed handshake; no-op otherwise.
+   */
+  void revert_span_configuration();
+
+  /**
    * @brief Configure the display device using the provided configuration.
    *
    * In some cases configuring display can fail due to transient issues and

@@ -22,11 +22,14 @@
 
 // local includes
 #include "audio.h"
+#include "native_resolution.h"
 #include "platform/common.h"
 #include "rtsp.h"
 
 // platform-specific includes
 #ifdef _WIN32
+  #include "platform/windows/native_resolution.h"
+
   #include <display_device/windows/settings_manager.h>
   #include <display_device/windows/win_api_layer.h>
   #include <display_device/windows/win_display_device.h>
@@ -50,6 +53,11 @@ namespace display_device {
       std::mutex mutex {};
       std::chrono::milliseconds config_revert_delay {0};
       std::unique_ptr<RetryScheduler<SettingsManagerInterface>> sm_instance {nullptr};
+      bool native_span_active {false};  ///< Native span modes require restoration at the last disconnect.
+#ifdef _WIN32
+      std::shared_ptr<WinDisplayDevice> native_api {};  ///< API shared with the settings manager.
+      PersistentState *native_state {nullptr};  ///< Borrowed state, protected by the scheduler lock.
+#endif
     } DD_DATA;
 
     /**
@@ -655,12 +663,13 @@ namespace display_device {
      */
     std::unique_ptr<SettingsManagerInterface> make_settings_manager([[maybe_unused]] const std::filesystem::path &persistence_filepath, [[maybe_unused]] const config::video_t &video_config) {
 #ifdef _WIN32
+      DD_DATA.native_api = std::make_shared<WinDisplayDevice>(std::make_shared<WinApiLayer>());
+      auto persistence = std::make_unique<PersistentState>(std::make_shared<FileSettingsPersistence>(persistence_filepath));
+      DD_DATA.native_state = persistence.get();
       return std::make_unique<SettingsManager>(
-        std::make_shared<WinDisplayDevice>(std::make_shared<WinApiLayer>()),
+        DD_DATA.native_api,
         std::make_shared<sunshine_audio_context_t>(),
-        std::make_unique<PersistentState>(
-          std::make_shared<FileSettingsPersistence>(persistence_filepath)
-        ),
+        std::move(persistence),
         WinWorkarounds {
           .m_hdr_blank_delay = video_config.dd.wa.hdr_toggle_delay != std::chrono::milliseconds::zero() ? std::make_optional(video_config.dd.wa.hdr_toggle_delay) : std::nullopt
         }
@@ -701,6 +710,7 @@ namespace display_device {
      * @note This is function does not lock mutex.
      */
     void revert_configuration_unlocked(const revert_option_e option) {
+      DD_DATA.native_span_active = false;
       if (!DD_DATA.sm_instance) {
         // Platform is not supported, nothing to do.
         return;
@@ -857,6 +867,56 @@ namespace display_device {
     BOOST_LOG(error) << "Failed to parse display device configuration. Display settings will not be changed.";
     // Error details should already be logged for failed_to_parse_tag_t case, and we also don't
     // want to revert active configuration in case we have any
+  }
+
+  void configure_span_displays(const rtsp_stream::launch_session_t &session) {
+#ifdef _WIN32
+    if (!session.span_displays) {
+      return;
+    }
+    std::lock_guard lock {DD_DATA.mutex};
+    if (!DD_DATA.sm_instance || !DD_DATA.native_state || DD_DATA.native_span_active) {
+      return;
+    }
+    bool restore_required = false;
+    try {
+      DD_DATA.sm_instance->execute([&](auto &settings_iface, auto &stop_token) {
+        const auto plan = plan_native_resolutions(settings_iface.enumAvailableDevices(), platf::span_display_layout(), platf::span_layout_from_string(session.span_client_layout));
+        if (!plan) {
+          BOOST_LOG(warning) << "Native span resolution skipped: capture and display layouts are not safely matched. Using capture scaling.";
+          return;
+        }
+        const auto result = apply_native_resolutions(*DD_DATA.native_api, *DD_DATA.native_state, *plan);
+        if (result == native_mode_result_e::applied) {
+          stop_token.requestStop();
+          DD_DATA.native_span_active = true;
+          BOOST_LOG(info) << "Native span resolutions applied and verified; original modes saved for restoration.";
+        } else if (result == native_mode_result_e::restore_required) {
+          restore_required = true;
+          BOOST_LOG(error) << "Native span resolution transaction failed. Restoring original modes.";
+        } else if (result == native_mode_result_e::unavailable) {
+          BOOST_LOG(warning) << "Native span resolution unavailable or recovery pending. Using capture scaling.";
+        } else {
+          BOOST_LOG(info) << "Native span resolutions already match the client.";
+        }
+      });
+    } catch (const std::exception &error) {
+      restore_required = true;
+      BOOST_LOG(error) << "Native span resolution failed: " << error.what();
+    }
+    if (restore_required) {
+      revert_configuration_unlocked(revert_option_e::try_indefinitely);
+    }
+#else
+    (void) session;
+#endif
+  }
+
+  void revert_span_configuration() {
+    std::lock_guard lock {DD_DATA.mutex};
+    if (DD_DATA.native_span_active) {
+      revert_configuration_unlocked(revert_option_e::try_indefinitely);
+    }
   }
 
   void configure_display(const SingleDisplayConfiguration &config) {

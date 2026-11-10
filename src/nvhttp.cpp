@@ -1403,9 +1403,10 @@ namespace nvhttp {
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
-      // A spanned capture streams the displays as they are, so their resolution must not be changed.
       if (!launch_session->span_displays) {
         display_device::configure_display(config::video, *launch_session);
+      } else {
+        display_device::configure_span_displays(*launch_session);
       }
 
       // Probe encoders again before streaming to ensure our chosen
@@ -1472,6 +1473,7 @@ namespace nvhttp {
     print_req<SunshineHTTPS>(request);
 
     pt::ptree tree;
+    bool revert_native_span {false};
     auto g = util::fail_guard([&]() {
       std::ostringstream data;
 
@@ -1482,6 +1484,9 @@ namespace nvhttp {
       pt::write_xml(data, tree);
       response->write(data.str());
       response->close_connection_after_response = true;
+      if (revert_native_span) {
+        display_device::revert_span_configuration();
+      }
     });
 
     auto current_appid = proc::proc.running();
@@ -1518,9 +1523,11 @@ namespace nvhttp {
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
-      // A spanned capture streams the displays as they are, so their resolution must not be changed.
       if (!launch_session->span_displays) {
         display_device::configure_display(config::video, *launch_session);
+      } else {
+        revert_native_span = true;
+        display_device::configure_span_displays(*launch_session);
       }
 
       // Probe encoders again before streaming to ensure our chosen
@@ -1560,6 +1567,7 @@ namespace nvhttp {
     tree.put("root.resume", 1);
 
     rtsp_stream::launch_session_raise(launch_session);
+    revert_native_span = false;
   }
 
   /**

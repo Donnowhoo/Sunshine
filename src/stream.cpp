@@ -2251,6 +2251,8 @@ namespace stream {
 
         if (revert_display_config) {
           display_device::revert_configuration();
+        } else {
+          display_device::revert_span_configuration();
         }
 
         platf::streaming_will_stop();
