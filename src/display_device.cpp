@@ -900,9 +900,9 @@ namespace display_device {
           BOOST_LOG(info) << "Native span resolutions already match the client.";
         }
       });
-    } catch (const std::exception &error) {
+    } catch (const std::exception &err) {
       restore_required = true;
-      BOOST_LOG(error) << "Native span resolution failed: " << error.what();
+      BOOST_LOG(error) << "Native span resolution failed: " << err.what();
     }
     if (restore_required) {
       revert_configuration_unlocked(revert_option_e::try_indefinitely);
