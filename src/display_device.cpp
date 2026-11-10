@@ -950,6 +950,17 @@ namespace display_device {
     auto lease = std::make_shared<lease_t>();
     first = DISPLAY_SESSIONS.policy.can_prepare();
     if (first) {
+      // A prior disconnect may still be waiting for a monitor to reconnect.
+      // Keep that recovery request when freezing its background retry below.
+      {
+        std::lock_guard lock {DD_DATA.mutex};
+        if (DD_DATA.sm_instance) {
+          const bool pending = DD_DATA.sm_instance->execute([](auto &) {
+            return DD_DATA.sm_instance->isScheduled();
+          });
+          DISPLAY_SESSIONS.policy.revert_requested = DISPLAY_SESSIONS.policy.revert_requested || pending;
+        }
+      }
       if (session.span_displays) {
         configure_span_displays(session);
       } else {
